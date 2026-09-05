@@ -16,28 +16,26 @@
 
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import pg from "pg";
 
 import { askForm, startServer, testUser } from "./helpers/server-harness.mjs";
 
+const { Pool } = pg;
+
 let server;
-let tmpDir;
 
 before(async () => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "studypal-hardening-"));
+  // Each startServer() gets its own migrated PostgreSQL database; see
+  // tests/helpers/test-database.mjs. SP-V2-002 replaced the temp-directory
+  // SQLite files this file used to manage.
   server = await startServer({
-    env: {
-      DATABASE_PATH: path.join(tmpDir, "hardening.db"),
-      FAKE_GEMINI_MODE: "json",
-    },
+    label: "harden",
+    env: { FAKE_GEMINI_MODE: "json" },
   });
 });
 
 after(async () => {
   await server?.stop();
-  fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 /** Every error response must be JSON carrying a string `error`. */
@@ -152,10 +150,8 @@ describe("7.3 username length is bounded", () => {
 describe("7.4 provider error detail is not leaked", () => {
   it("returns a fixed message on AI failure, keeping status and shape", async () => {
     const failing = await startServer({
-      env: {
-        DATABASE_PATH: path.join(tmpDir, "ai-fail.db"),
-        FAKE_GEMINI_MODE: "http-error",
-      },
+      label: "aifail",
+      env: { FAKE_GEMINI_MODE: "http-error" },
     });
 
     try {
@@ -247,8 +243,8 @@ describe("7.5 uploads are bounded and type-checked", () => {
 describe("7.6 CORS can be restricted without breaking local development", () => {
   it("allows only the configured origin when CORS_ORIGINS is set", async () => {
     const restricted = await startServer({
+      label: "cors",
       env: {
-        DATABASE_PATH: path.join(tmpDir, "cors.db"),
         CORS_ORIGINS: "https://studypal.example",
         NODE_ENV: "production",
       },
@@ -284,10 +280,8 @@ describe("7.6 CORS can be restricted without breaking local development", () => 
 
   it("keeps localhost working outside production even when an origin is configured", async () => {
     const configured = await startServer({
-      env: {
-        DATABASE_PATH: path.join(tmpDir, "cors-dev.db"),
-        FRONTEND_URL: "https://studypal.example",
-      },
+      label: "corsdev",
+      env: { FRONTEND_URL: "https://studypal.example" },
     });
 
     try {
@@ -339,11 +333,8 @@ describe("7.8 GET /health", () => {
     // The fake Gemini transport fails every call in this mode. If /health
     // touched the provider it could not return 200.
     const isolated = await startServer({
-      env: {
-        DATABASE_PATH: path.join(tmpDir, "health.db"),
-        FAKE_GEMINI_MODE: "network-error",
-        GEMINI_API_KEY: "",
-      },
+      label: "health",
+      env: { FAKE_GEMINI_MODE: "network-error", GEMINI_API_KEY: "" },
     });
 
     try {
@@ -357,7 +348,8 @@ describe("7.8 GET /health", () => {
 
   it("works with no GEMINI_API_KEY set at all", async () => {
     const keyless = await startServer({
-      env: { DATABASE_PATH: path.join(tmpDir, "keyless.db"), GEMINI_API_KEY: "" },
+      label: "keyless",
+      env: { GEMINI_API_KEY: "" },
     });
 
     try {
@@ -394,22 +386,97 @@ describe("baseline security headers", () => {
   });
 });
 
-// ── Cross-cutting: DATABASE_PATH is honoured ───────────────────────────────
+// ── Cross-cutting: the configured database is the one that is used ─────────
+//
+// Replaces SP-V2-001's "writes to the configured DATABASE_PATH" test, which
+// asserted that a SQLite file appeared on disk. The property being checked is
+// the same one — configuration decides where data goes — but the evidence is now
+// a row in a named PostgreSQL database rather than the existence of a file.
 describe("configuration", () => {
-  it("writes to the configured DATABASE_PATH", async () => {
-    const dbPath = path.join(tmpDir, "explicit-path.db");
-    const configured = await startServer({ env: { DATABASE_PATH: dbPath } });
+  it("writes to the database named by the connection string", async () => {
+    const configured = await startServer({ label: "explicit" });
+    const username = testUser("cfg");
 
     try {
-      await configured.request("POST", "/api/session", {
-        json: { username: testUser("cfg") },
+      const res = await configured.request("POST", "/api/session", {
+        json: { username },
       });
-      assert.ok(
-        fs.existsSync(dbPath),
-        "DATABASE_PATH must control where the database is created",
-      );
+      assert.equal(res.status, 200);
+
+      // Connect to that database directly — not through the API — and confirm
+      // the row landed there and not somewhere else.
+      const pool = new Pool({ connectionString: configured.databaseUrl });
+      try {
+        const { rows } = await pool.query(
+          "SELECT username FROM users WHERE username = $1",
+          [username],
+        );
+        assert.equal(
+          rows.length,
+          1,
+          `the row must be in ${configured.databaseName}, the database the ` +
+            "server was configured with",
+        );
+      } finally {
+        await pool.end();
+      }
     } finally {
       await configured.stop();
+    }
+  });
+
+  it("refuses to start under NODE_ENV=test with no test database configured", async () => {
+    // The guard that stops `npm test` from reaching a real database. An empty
+    // STUDYPAL_TEST_DATABASE_URL must be fatal, NOT a silent fall back to
+    // DATABASE_URL — which is set in this environment, so a fallback would
+    // connect to the developer's working database.
+    await assert.rejects(
+      () =>
+        startServer({
+          database: false,
+          env: { STUDYPAL_TEST_DATABASE_URL: "" },
+        }),
+      (err) => {
+        assert.match(err.message, /server exited early/);
+        assert.match(err.message, /STUDYPAL_TEST_DATABASE_URL is required/);
+        return true;
+      },
+    );
+  });
+});
+
+// ── Cross-cutting: an unreachable database degrades, it does not crash ─────
+describe("database outage behaviour", () => {
+  it("still starts and reports 503 from /health when PostgreSQL is unreachable", async () => {
+    // Port 1 has nothing listening. The documented decision (see
+    // docs/database-architecture.md) is that the server starts anyway and
+    // reports its state, rather than crash-looping under an orchestrator.
+    const unreachable = await startServer({
+      database: false,
+      env: {
+        STUDYPAL_TEST_DATABASE_URL:
+          "postgresql://nobody:nothing@127.0.0.1:1/studypal_test_unreachable",
+      },
+    });
+
+    try {
+      const res = await unreachable.request("GET", "/health");
+      assert.equal(res.status, 503);
+      assert.equal(res.body.status, "degraded");
+      assert.equal(res.body.database, "unavailable");
+      assertNoLeak(res.text);
+      // The connection error names the host, port and user; it must be logged,
+      // not serialised.
+      assert.doesNotMatch(res.text, /127\.0\.0\.1|nobody|nothing|ECONNREFUSED/);
+
+      // A data endpoint fails as a clean JSON 500 rather than an HTML page or a
+      // hang, and never falls back to a local file.
+      const history = await unreachable.request("GET", "/api/history/someone");
+      assert.equal(history.status, 500);
+      assert.equal(typeof history.body.error, "string");
+      assertNoLeak(history.text);
+    } finally {
+      await unreachable.stop();
     }
   });
 });
