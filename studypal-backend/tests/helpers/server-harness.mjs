@@ -44,16 +44,22 @@ export function testUser(prefix = "test") {
  * Start the backend. Returns { request, stop, stderr, port }.
  *
  * @param {object} opts
- * @param {string} [opts.entry]   entrypoint relative to the backend root
+ * @param {string} [opts.entry]   entrypoint, absolute or relative to the backend
+ *                                root. Must live INSIDE the backend directory:
+ *                                Node resolves a module's imports from its own
+ *                                location, so an entrypoint in /tmp cannot find
+ *                                express or better-sqlite3.
  * @param {object} [opts.env]     extra environment variables
  */
 export async function startServer(opts = {}) {
   const entry = opts.entry || process.env.STUDYPAL_ENTRY || "server.js";
+  // resolve() rather than join() so an absolute entry is honoured as given.
+  const entryPath = path.resolve(BACKEND_ROOT, entry);
   const port = await freePort();
 
   const child = spawn(
     process.execPath,
-    ["--import", PRELOAD, path.join(BACKEND_ROOT, entry)],
+    ["--import", PRELOAD, entryPath],
     {
       cwd: BACKEND_ROOT,
       env: {
@@ -98,23 +104,36 @@ export async function startServer(opts = {}) {
     }
   }
 
-  async function request(method, pathname, { json, form, headers } = {}) {
+  /**
+   * @param {string} method
+   * @param {string} pathname
+   * @param {object} [opts]
+   * @param {object}   [opts.json]    serialised as an application/json body
+   * @param {FormData} [opts.form]    sent as multipart (fetch sets the boundary)
+   * @param {string}   [opts.body]    raw body, sent exactly as given — used to
+   *                                  send deliberately malformed payloads
+   * @param {object}   [opts.headers]
+   * @returns {Promise<{status: number, headers: Headers, body: object|string, text: string}>}
+   */
+  async function request(method, pathname, { json, form, body, headers } = {}) {
     const init = { method, headers: { ...headers } };
     if (json !== undefined) {
       init.headers["content-type"] = "application/json";
       init.body = JSON.stringify(json);
     } else if (form !== undefined) {
       init.body = form; // fetch sets the multipart boundary itself
+    } else if (body !== undefined) {
+      init.body = body;
     }
     const res = await fetch(base + pathname, init);
     const text = await res.text();
-    let body;
+    let parsed;
     try {
-      body = JSON.parse(text);
+      parsed = JSON.parse(text);
     } catch {
-      body = text;
+      parsed = text;
     }
-    return { status: res.status, headers: res.headers, body, text };
+    return { status: res.status, headers: res.headers, body: parsed, text };
   }
 
   return {
