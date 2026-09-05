@@ -5,6 +5,11 @@ export const metadata = {
   description: "Your personal AI study companion powered by Gemini",
 };
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+};
+
 export default function RootLayout({ children }) {
   return (
     <html lang="en">

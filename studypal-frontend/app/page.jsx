@@ -17,7 +17,18 @@ function formatDate(iso) {
   }
 }
 
-// ── Practice Question with animated reveal ────────────────────────────────────
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768);
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
+  return isMobile;
+}
+
+// ── Practice Question ─────────────────────────────────────────────────────────
 function PracticeQuestion({ pq, index }) {
   const [open, setOpen] = useState(false);
   return (
@@ -46,7 +57,6 @@ function PracticeQuestion({ pq, index }) {
           display: "flex",
           alignItems: "center",
           gap: 6,
-          transition: "opacity 0.15s",
         }}
         onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.7")}
         onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
@@ -84,13 +94,13 @@ function PracticeQuestion({ pq, index }) {
   );
 }
 
-// ── AI Message with staggered children ───────────────────────────────────────
+// ── AI Message ────────────────────────────────────────────────────────────────
 function AiMessage({ data }) {
   return (
     <div
       style={{
         alignSelf: "flex-start",
-        maxWidth: "84%",
+        maxWidth: "92%",
         display: "flex",
         flexDirection: "column",
         gap: 14,
@@ -177,7 +187,7 @@ function UserMessage({ question, filename }) {
       className="msg-in-right"
       style={{
         alignSelf: "flex-end",
-        maxWidth: "72%",
+        maxWidth: "85%",
         background: "linear-gradient(135deg,#22200e,#1e1c0a)",
         border: "1px solid var(--gold-dim)",
         borderRadius: "12px 12px 2px 12px",
@@ -278,6 +288,208 @@ function AttachButton({ fileInputRef, onChange }) {
   );
 }
 
+// ── History Panel ─────────────────────────────────────────────────────────────
+function HistoryPanel({ history, replayHistory, onSelect }) {
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+      {history.length === 0 ? (
+        <div
+          style={{
+            textAlign: "center",
+            padding: "40px 16px",
+            color: "var(--muted)",
+            fontSize: "0.84rem",
+          }}
+        >
+          <div style={{ fontSize: "2rem", marginBottom: 12 }}>🕓</div>Your
+          questions will appear here.
+        </div>
+      ) : (
+        history.map((item, i) => (
+          <div
+            key={i}
+            onClick={() => {
+              replayHistory(item);
+              onSelect && onSelect();
+            }}
+            className="history-card slide-right"
+            style={{
+              background: "var(--bg3)",
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+              padding: 12,
+              marginBottom: 8,
+              cursor: "pointer",
+              animationDelay: `${i * 0.04}s`,
+            }}
+          >
+            <div
+              style={{
+                fontSize: "0.7rem",
+                fontWeight: 500,
+                letterSpacing: "0.06em",
+                textTransform: "uppercase",
+                color: "var(--gold)",
+                marginBottom: 4,
+              }}
+            >
+              {item.topic}
+            </div>
+            <div
+              style={{
+                fontSize: "0.82rem",
+                color: "var(--cream)",
+                lineHeight: 1.4,
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              {item.question}
+            </div>
+            {item.has_file && (
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  background: "rgba(201,168,76,0.12)",
+                  border: "1px solid var(--gold-dim)",
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  fontSize: "0.65rem",
+                  color: "var(--gold)",
+                  marginTop: 6,
+                }}
+              >
+                📎 {item.filename}
+              </div>
+            )}
+            <div
+              style={{
+                fontSize: "0.72rem",
+                color: "var(--muted)",
+                marginTop: 6,
+              }}
+            >
+              {formatDate(item.created_at)}
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+// ── Progress Panel ────────────────────────────────────────────────────────────
+function ProgressPanel({ progress, countKey }) {
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+      <div
+        style={{
+          background: "var(--bg3)",
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          padding: 16,
+          marginBottom: 10,
+          textAlign: "center",
+        }}
+      >
+        <div
+          key={countKey}
+          className="pop-in"
+          style={{
+            fontFamily: "'Cormorant Garamond',serif",
+            fontSize: "2.4rem",
+            fontWeight: 600,
+            color: "var(--gold)",
+            lineHeight: 1,
+          }}
+        >
+          {progress.total_questions}
+        </div>
+        <div
+          style={{
+            fontSize: "0.75rem",
+            color: "var(--muted)",
+            marginTop: 4,
+            textTransform: "uppercase",
+            letterSpacing: "0.05em",
+          }}
+        >
+          Questions Asked
+        </div>
+      </div>
+      <div
+        style={{
+          fontSize: "0.72rem",
+          fontWeight: 500,
+          letterSpacing: "0.07em",
+          textTransform: "uppercase",
+          color: "var(--muted)",
+          marginBottom: 8,
+        }}
+      >
+        Topics Explored
+      </div>
+      {progress.topics.length === 0 ? (
+        <div
+          style={{
+            textAlign: "center",
+            padding: "20px 0",
+            color: "var(--muted)",
+            fontSize: "0.84rem",
+          }}
+        >
+          <div style={{ fontSize: "1.4rem", marginBottom: 8 }}>🗂️</div>Topics
+          appear as you study.
+        </div>
+      ) : (
+        progress.topics.map((t, i) => (
+          <div
+            key={`${t.topic}-${i}`}
+            className="slide-right"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              background: "var(--bg3)",
+              border: "1px solid var(--border)",
+              borderRadius: 6,
+              padding: "8px 12px",
+              marginBottom: 6,
+              fontSize: "0.8rem",
+              animationDelay: `${i * 0.05}s`,
+              transition: "border-color 0.2s",
+            }}
+            onMouseEnter={(e) =>
+              (e.currentTarget.style.borderColor = "var(--gold-dim)")
+            }
+            onMouseLeave={(e) =>
+              (e.currentTarget.style.borderColor = "var(--border)")
+            }
+          >
+            <span style={{ color: "var(--cream)" }}>{t.topic}</span>
+            <span
+              style={{
+                background: "rgba(201,168,76,0.15)",
+                color: "var(--gold)",
+                borderRadius: 4,
+                padding: "2px 8px",
+                fontSize: "0.72rem",
+                fontFamily: "'JetBrains Mono',monospace",
+              }}
+            >
+              {t.count}
+            </span>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function Home() {
   const [screen, setScreen] = useState("login");
@@ -292,10 +504,11 @@ export default function Home() {
   const [history, setHistory] = useState([]);
   const [progress, setProgress] = useState({ total_questions: 0, topics: [] });
   const [countKey, setCountKey] = useState(0);
+  const [mobileTab, setMobileTab] = useState("chat"); // 'chat' | 'history' | 'progress'
   const prevTotalRef = useRef(0);
-
   const chatRef = useRef(null);
   const fileInputRef = useRef(null);
+  const isMobile = useIsMobile();
 
   useEffect(() => {
     if (chatRef.current)
@@ -420,6 +633,7 @@ export default function Home() {
           background:
             "radial-gradient(ellipse 80% 60% at 50% 0%,#1e1a0e,transparent 70%),var(--bg)",
           position: "relative",
+          padding: "20px",
         }}
       >
         <div
@@ -439,8 +653,9 @@ export default function Home() {
             background: "var(--bg2)",
             border: "1px solid var(--border)",
             borderRadius: 16,
-            padding: "56px 48px",
-            width: "min(480px,92vw)",
+            padding: isMobile ? "40px 28px" : "56px 48px",
+            width: "100%",
+            maxWidth: 480,
             textAlign: "center",
             boxShadow: "0 32px 80px rgba(0,0,0,0.6)",
           }}
@@ -463,7 +678,7 @@ export default function Home() {
           <h1
             style={{
               fontFamily: "'Cormorant Garamond',serif",
-              fontSize: "2.4rem",
+              fontSize: isMobile ? "2rem" : "2.4rem",
               fontWeight: 600,
               color: "var(--cream)",
               marginBottom: 8,
@@ -552,7 +767,381 @@ export default function Home() {
       </div>
     );
 
-  // ── App ────────────────────────────────────────────────────────────────────
+  // ── Chat Panel ─────────────────────────────────────────────────────────────
+  const ChatPanel = (
+    <main
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        background: "var(--bg)",
+        flex: 1,
+      }}
+    >
+      <div
+        ref={chatRef}
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          padding: isMobile ? 16 : 24,
+          display: "flex",
+          flexDirection: "column",
+          gap: 24,
+        }}
+      >
+        {messages.length === 0 && (
+          <div
+            className="welcome-glow fade-up"
+            style={{
+              background: "linear-gradient(135deg,#1a180e,#0f0f13)",
+              border: "1px solid var(--gold-dim)",
+              borderRadius: 12,
+              padding: isMobile ? "20px 18px" : "28px 32px",
+              textAlign: "center",
+            }}
+          >
+            <h2
+              style={{
+                fontFamily: "'Cormorant Garamond',serif",
+                fontSize: isMobile ? "1.4rem" : "1.8rem",
+                fontWeight: 600,
+                color: "var(--gold)",
+                marginBottom: 8,
+              }}
+            >
+              What do you want to learn today?
+            </h2>
+            <p
+              style={{
+                color: "var(--muted)",
+                fontSize: "0.9rem",
+                lineHeight: 1.6,
+              }}
+            >
+              Type a topic, paste a question, or upload a file.
+              <br />
+              I'll explain it simply and give you practice questions.
+            </p>
+          </div>
+        )}
+        {messages.map((msg, i) => {
+          if (msg.type === "user")
+            return (
+              <UserMessage
+                key={i}
+                question={msg.question}
+                filename={msg.filename}
+              />
+            );
+          if (msg.type === "typing") return <TypingIndicator key={i} />;
+          if (msg.type === "ai") return <AiMessage key={i} data={msg.data} />;
+        })}
+      </div>
+
+      <div
+        className="rise-up"
+        style={{
+          borderTop: "1px solid var(--border)",
+          background: "var(--bg2)",
+          padding: isMobile ? "12px 14px" : "16px 20px",
+        }}
+      >
+        {file && (
+          <div
+            className="file-in"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              background: "rgba(201,168,76,0.08)",
+              border: "1px solid var(--gold-dim)",
+              borderRadius: 8,
+              padding: "8px 14px",
+              marginBottom: 12,
+              fontSize: "0.82rem",
+              color: "var(--gold)",
+            }}
+          >
+            📎 {file.name}
+            <button
+              onClick={() => {
+                setFile(null);
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              }}
+              style={{
+                marginLeft: "auto",
+                background: "none",
+                border: "none",
+                color: "var(--muted)",
+                cursor: "pointer",
+                fontSize: "1rem",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--red)")}
+              onMouseLeave={(e) =>
+                (e.currentTarget.style.color = "var(--muted)")
+              }
+            >
+              ✕
+            </button>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+          <AttachButton
+            fileInputRef={fileInputRef}
+            onChange={(e) => setFile(e.target.files[0] || null)}
+          />
+          <textarea
+            value={question}
+            onChange={handleTextarea}
+            onKeyDown={handleKeyDown}
+            placeholder="Ask a question or topic…"
+            rows={1}
+            onFocus={(e) => (e.target.style.borderColor = "var(--gold)")}
+            onBlur={(e) => (e.target.style.borderColor = "var(--border)")}
+            style={{
+              flex: 1,
+              background: "var(--bg3)",
+              border: "1px solid var(--border)",
+              borderRadius: 10,
+              padding: "11px 14px",
+              color: "var(--cream)",
+              fontFamily: "inherit",
+              fontSize: "0.9rem",
+              resize: "none",
+              outline: "none",
+              lineHeight: 1.5,
+              minHeight: 44,
+              maxHeight: 140,
+              transition: "border-color 0.2s",
+            }}
+          />
+          <button
+            onClick={handleAsk}
+            disabled={sending}
+            className={!sending ? "send-pulse" : ""}
+            style={{
+              flexShrink: 0,
+              width: 42,
+              height: 42,
+              background: "var(--gold)",
+              border: "none",
+              borderRadius: 10,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: sending ? "not-allowed" : "pointer",
+              fontSize: 17,
+              color: "#0f0f13",
+              opacity: sending ? 0.4 : 1,
+            }}
+          >
+            ➤
+          </button>
+        </div>
+        {!isMobile && (
+          <p
+            style={{
+              fontSize: "0.72rem",
+              color: "var(--muted)",
+              marginTop: 8,
+              textAlign: "center",
+            }}
+          >
+            Supports PDF, images & text · Enter to send · Powered by Gemini
+          </p>
+        )}
+      </div>
+    </main>
+  );
+
+  // ── Mobile Bottom Nav ──────────────────────────────────────────────────────
+  const MobileNav = (
+    <nav
+      style={{
+        display: "flex",
+        borderTop: "1px solid var(--border)",
+        background: "var(--bg2)",
+        height: 56,
+      }}
+    >
+      {[
+        { id: "chat", icon: "", label: "Chat" },
+        { id: "history", icon: "", label: "History" },
+        { id: "progress", icon: "", label: "Progress" },
+      ].map((tab) => (
+        <button
+          key={tab.id}
+          onClick={() => setMobileTab(tab.id)}
+          style={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 3,
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            color: mobileTab === tab.id ? "var(--gold)" : "var(--muted)",
+            fontSize: "0.65rem",
+            fontFamily: "inherit",
+            fontWeight: 500,
+            letterSpacing: "0.04em",
+            transition: "color 0.15s",
+            borderTop:
+              mobileTab === tab.id
+                ? "2px solid var(--gold)"
+                : "2px solid transparent",
+          }}
+        >
+          <span style={{ fontSize: 18 }}>{tab.icon}</span>
+          {tab.label}
+        </button>
+      ))}
+    </nav>
+  );
+
+  // ── App: Mobile ────────────────────────────────────────────────────────────
+  if (isMobile)
+    return (
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          height: "100vh",
+          overflow: "hidden",
+        }}
+      >
+        <header
+          className="header-drop"
+          style={{
+            background: "var(--bg2)",
+            borderBottom: "1px solid var(--border)",
+            padding: "0 16px",
+            height: 54,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexShrink: 0,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div
+              className="logo-shimmer"
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 7,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 13,
+              }}
+            >
+              📚
+            </div>
+            <span
+              style={{
+                fontFamily: "'Cormorant Garamond',serif",
+                fontSize: "1.2rem",
+                fontWeight: 600,
+                color: "var(--cream)",
+              }}
+            >
+              StudyPal
+            </span>
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              background: "var(--bg3)",
+              border: "1px solid var(--border)",
+              borderRadius: 100,
+              padding: "5px 12px",
+              fontSize: "0.8rem",
+              color: "var(--muted)",
+            }}
+          >
+            👤&nbsp;
+            <strong style={{ color: "var(--cream)" }}>{username}</strong>
+          </div>
+        </header>
+
+        {/* Mobile tab content */}
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
+          {mobileTab === "chat" && ChatPanel}
+          {mobileTab === "history" && (
+            <div
+              style={{
+                flex: 1,
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+                background: "var(--bg2)",
+              }}
+            >
+              <div
+                style={{
+                  padding: "14px 16px",
+                  borderBottom: "1px solid var(--border)",
+                  fontSize: "0.72rem",
+                  fontWeight: 500,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  color: "var(--muted)",
+                }}
+              >
+                📋 Question History
+              </div>
+              <HistoryPanel
+                history={history}
+                replayHistory={replayHistory}
+                onSelect={() => setMobileTab("chat")}
+              />
+            </div>
+          )}
+          {mobileTab === "progress" && (
+            <div
+              style={{
+                flex: 1,
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+                background: "var(--bg2)",
+              }}
+            >
+              <div
+                style={{
+                  padding: "14px 16px",
+                  borderBottom: "1px solid var(--border)",
+                  fontSize: "0.72rem",
+                  fontWeight: 500,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  color: "var(--muted)",
+                }}
+              >
+                📊 My Progress
+              </div>
+              <ProgressPanel progress={progress} countKey={countKey} />
+            </div>
+          )}
+        </div>
+
+        {MobileNav}
+      </div>
+    );
+
+  // ── App: Desktop ───────────────────────────────────────────────────────────
   return (
     <div>
       <header
@@ -643,282 +1232,12 @@ export default function Home() {
               color: "var(--muted)",
             }}
           >
-            Question History
+            📋 Question History
           </div>
-          <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
-            {history.length === 0 ? (
-              <div
-                style={{
-                  textAlign: "center",
-                  padding: "40px 16px",
-                  color: "var(--muted)",
-                  fontSize: "0.84rem",
-                }}
-              >
-                <div style={{ fontSize: "2rem", marginBottom: 12 }}></div>Your
-                questions will appear here.
-              </div>
-            ) : (
-              history.map((item, i) => (
-                <div
-                  key={i}
-                  onClick={() => replayHistory(item)}
-                  className="history-card slide-right"
-                  style={{
-                    background: "var(--bg3)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 8,
-                    padding: 12,
-                    marginBottom: 8,
-                    cursor: "pointer",
-                    animationDelay: `${i * 0.04}s`,
-                  }}
-                >
-                  <div
-                    style={{
-                      fontSize: "0.7rem",
-                      fontWeight: 500,
-                      letterSpacing: "0.06em",
-                      textTransform: "uppercase",
-                      color: "var(--gold)",
-                      marginBottom: 4,
-                    }}
-                  >
-                    {item.topic}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: "0.82rem",
-                      color: "var(--cream)",
-                      lineHeight: 1.4,
-                      display: "-webkit-box",
-                      WebkitLineClamp: 2,
-                      WebkitBoxOrient: "vertical",
-                      overflow: "hidden",
-                    }}
-                  >
-                    {item.question}
-                  </div>
-                  {item.has_file && (
-                    <div
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 4,
-                        background: "rgba(201,168,76,0.12)",
-                        border: "1px solid var(--gold-dim)",
-                        borderRadius: 4,
-                        padding: "2px 6px",
-                        fontSize: "0.65rem",
-                        color: "var(--gold)",
-                        marginTop: 6,
-                      }}
-                    >
-                      📎 {item.filename}
-                    </div>
-                  )}
-                  <div
-                    style={{
-                      fontSize: "0.72rem",
-                      color: "var(--muted)",
-                      marginTop: 6,
-                    }}
-                  >
-                    {formatDate(item.created_at)}
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
+          <HistoryPanel history={history} replayHistory={replayHistory} />
         </aside>
 
-        {/* MIDDLE: Chat */}
-        <main
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            overflow: "hidden",
-            background: "var(--bg)",
-          }}
-        >
-          <div
-            ref={chatRef}
-            style={{
-              flex: 1,
-              overflowY: "auto",
-              padding: 24,
-              display: "flex",
-              flexDirection: "column",
-              gap: 24,
-            }}
-          >
-            {messages.length === 0 && (
-              <div
-                className="welcome-glow fade-up"
-                style={{
-                  background: "linear-gradient(135deg,#1a180e,#0f0f13)",
-                  border: "1px solid var(--gold-dim)",
-                  borderRadius: 12,
-                  padding: "28px 32px",
-                  textAlign: "center",
-                }}
-              >
-                <h2
-                  style={{
-                    fontFamily: "'Cormorant Garamond',serif",
-                    fontSize: "1.8rem",
-                    fontWeight: 600,
-                    color: "var(--gold)",
-                    marginBottom: 8,
-                  }}
-                >
-                  What do you want to learn today?
-                </h2>
-                <p
-                  style={{
-                    color: "var(--muted)",
-                    fontSize: "0.9rem",
-                    lineHeight: 1.6,
-                  }}
-                >
-                  Type a topic, paste a question, or upload a file.
-                  <br />
-                  I'll explain it simply and give you practice questions.
-                </p>
-              </div>
-            )}
-            {messages.map((msg, i) => {
-              if (msg.type === "user")
-                return (
-                  <UserMessage
-                    key={i}
-                    question={msg.question}
-                    filename={msg.filename}
-                  />
-                );
-              if (msg.type === "typing") return <TypingIndicator key={i} />;
-              if (msg.type === "ai")
-                return <AiMessage key={i} data={msg.data} />;
-            })}
-          </div>
-
-          {/* Input */}
-          <div
-            className="rise-up"
-            style={{
-              borderTop: "1px solid var(--border)",
-              background: "var(--bg2)",
-              padding: "16px 20px",
-            }}
-          >
-            {file && (
-              <div
-                className="file-in"
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  background: "rgba(201,168,76,0.08)",
-                  border: "1px solid var(--gold-dim)",
-                  borderRadius: 8,
-                  padding: "8px 14px",
-                  marginBottom: 12,
-                  fontSize: "0.82rem",
-                  color: "var(--gold)",
-                }}
-              >
-                📎 {file.name}
-                <button
-                  onClick={() => {
-                    setFile(null);
-                    if (fileInputRef.current) fileInputRef.current.value = "";
-                  }}
-                  style={{
-                    marginLeft: "auto",
-                    background: "none",
-                    border: "none",
-                    color: "var(--muted)",
-                    cursor: "pointer",
-                    fontSize: "1rem",
-                    transition: "color 0.15s",
-                  }}
-                  onMouseEnter={(e) =>
-                    (e.currentTarget.style.color = "var(--red)")
-                  }
-                  onMouseLeave={(e) =>
-                    (e.currentTarget.style.color = "var(--muted)")
-                  }
-                >
-                  ✕
-                </button>
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-              <AttachButton
-                fileInputRef={fileInputRef}
-                onChange={(e) => setFile(e.target.files[0] || null)}
-              />
-              <textarea
-                value={question}
-                onChange={handleTextarea}
-                onKeyDown={handleKeyDown}
-                placeholder="Ask a question or describe a topic…"
-                rows={1}
-                onFocus={(e) => (e.target.style.borderColor = "var(--gold)")}
-                onBlur={(e) => (e.target.style.borderColor = "var(--border)")}
-                style={{
-                  flex: 1,
-                  background: "var(--bg3)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 10,
-                  padding: "11px 14px",
-                  color: "var(--cream)",
-                  fontFamily: "inherit",
-                  fontSize: "0.9rem",
-                  resize: "none",
-                  outline: "none",
-                  lineHeight: 1.5,
-                  minHeight: 44,
-                  maxHeight: 140,
-                  transition: "border-color 0.2s",
-                }}
-              />
-              <button
-                onClick={handleAsk}
-                disabled={sending}
-                className={!sending ? "send-pulse" : ""}
-                style={{
-                  flexShrink: 0,
-                  width: 42,
-                  height: 42,
-                  background: "var(--gold)",
-                  border: "none",
-                  borderRadius: 10,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: sending ? "not-allowed" : "pointer",
-                  fontSize: 17,
-                  color: "#0f0f13",
-                  opacity: sending ? 0.4 : 1,
-                  transition: "opacity 0.2s, transform 0.15s",
-                }}
-              >
-                ➤
-              </button>
-            </div>
-            <p
-              style={{
-                fontSize: "0.72rem",
-                color: "var(--muted)",
-                marginTop: 8,
-                textAlign: "center",
-              }}
-            >
-              Supports PDF, images & text · Enter to send · Powered by Gemini
-            </p>
-          </div>
-        </main>
+        {ChatPanel}
 
         {/* RIGHT: Progress */}
         <aside
@@ -942,110 +1261,9 @@ export default function Home() {
               color: "var(--muted)",
             }}
           >
-            My Progress
+            📊 My Progress
           </div>
-          <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
-            <div
-              style={{
-                background: "var(--bg3)",
-                border: "1px solid var(--border)",
-                borderRadius: 8,
-                padding: 16,
-                marginBottom: 10,
-                textAlign: "center",
-              }}
-            >
-              <div
-                key={countKey}
-                className="pop-in"
-                style={{
-                  fontFamily: "'Cormorant Garamond',serif",
-                  fontSize: "2.4rem",
-                  fontWeight: 600,
-                  color: "var(--gold)",
-                  lineHeight: 1,
-                }}
-              >
-                {progress.total_questions}
-              </div>
-              <div
-                style={{
-                  fontSize: "0.75rem",
-                  color: "var(--muted)",
-                  marginTop: 4,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.05em",
-                }}
-              >
-                Questions Asked
-              </div>
-            </div>
-            <div
-              style={{
-                fontSize: "0.72rem",
-                fontWeight: 500,
-                letterSpacing: "0.07em",
-                textTransform: "uppercase",
-                color: "var(--muted)",
-                marginBottom: 8,
-              }}
-            >
-              Topics Explored
-            </div>
-            {progress.topics.length === 0 ? (
-              <div
-                style={{
-                  textAlign: "center",
-                  padding: "20px 0",
-                  color: "var(--muted)",
-                  fontSize: "0.84rem",
-                }}
-              >
-                <div style={{ fontSize: "1.4rem", marginBottom: 8 }}></div>
-                Topics appear as you study.
-              </div>
-            ) : (
-              progress.topics.map((t, i) => (
-                <div
-                  key={`${t.topic}-${i}`}
-                  className="slide-right"
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    background: "var(--bg3)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: "8px 12px",
-                    marginBottom: 6,
-                    fontSize: "0.8rem",
-                    animationDelay: `${i * 0.05}s`,
-                    transition: "border-color 0.2s",
-                  }}
-                  onMouseEnter={(e) =>
-                    (e.currentTarget.style.borderColor = "var(--gold-dim)")
-                  }
-                  onMouseLeave={(e) =>
-                    (e.currentTarget.style.borderColor = "var(--border)")
-                  }
-                >
-                  <span style={{ color: "var(--cream)" }}>{t.topic}</span>
-                  <span
-                    style={{
-                      background: "rgba(201,168,76,0.15)",
-                      color: "var(--gold)",
-                      borderRadius: 4,
-                      padding: "2px 8px",
-                      fontSize: "0.72rem",
-                      fontFamily: "'JetBrains Mono',monospace",
-                    }}
-                  >
-                    {t.count}
-                  </span>
-                </div>
-              ))
-            )}
-          </div>
+          <ProgressPanel progress={progress} countKey={countKey} />
         </aside>
       </div>
     </div>
