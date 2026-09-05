@@ -59,6 +59,100 @@ function list(name) {
 
 const nodeEnv = process.env.NODE_ENV || "development";
 
+// ── database URL ──────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the PostgreSQL connection string.
+ *
+ * Under NODE_ENV=test only STUDYPAL_TEST_DATABASE_URL is consulted, and it is
+ * mandatory. DATABASE_URL is not a fallback there: the test suite truncates and
+ * re-migrates whatever it connects to, so silently borrowing the development
+ * URL would destroy the developer's data. Failing to start is the safe outcome.
+ *
+ * There is no SQLite fallback anywhere. PostgreSQL is the only database.
+ */
+function resolveDatabaseUrl() {
+  if (nodeEnv === "test") {
+    const url = process.env.STUDYPAL_TEST_DATABASE_URL?.trim();
+    if (!url) {
+      throw new Error(
+        "STUDYPAL_TEST_DATABASE_URL is required when NODE_ENV=test. " +
+          "It must point at a database that exists only for tests — the suite " +
+          "drops and recreates its schema. DATABASE_URL is deliberately not " +
+          "used as a fallback.",
+      );
+    }
+    return url;
+  }
+
+  const url = process.env.DATABASE_URL?.trim();
+  if (!url) {
+    throw new Error(
+      "DATABASE_URL is required. StudyPal stores everything in PostgreSQL and " +
+        "has no local-file fallback. Example: " +
+        "postgresql://user:password@127.0.0.1:5434/studypal " +
+        "(see .env.example and compose.yaml).",
+    );
+  }
+  return url;
+}
+
+const databaseUrl = resolveDatabaseUrl();
+
+/** Parse a connection string, tolerating values libpq accepts but URL does not. */
+function parseUrl(url) {
+  try {
+    return new URL(url);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A connection string with the password removed.
+ *
+ * Every log line, error message and health payload that mentions the database
+ * uses this. The raw URL is never written anywhere: it carries a credential.
+ */
+function redactUrl(url) {
+  const parsed = parseUrl(url);
+  if (!parsed) return "<unparseable DATABASE_URL>";
+  if (parsed.password) parsed.password = "***";
+  return parsed.toString();
+}
+
+/** Database name from the URL path, or "" when it cannot be determined. */
+function databaseName(url) {
+  return decodeURIComponent(parseUrl(url)?.pathname.replace(/^\//, "") ?? "");
+}
+
+/**
+ * Whether this URL names something that is obviously a throwaway test database.
+ *
+ * Used as a guard, never as a convenience: destructive setup refuses to run
+ * unless the name matches. A developer database called `studypal` fails the
+ * check, which is the entire point.
+ */
+function looksLikeTestDatabase(url) {
+  return /(^|[_-])test($|[_-])|_test$|^test/i.test(databaseName(url));
+}
+
+/**
+ * TLS for the connection. Off by default because local development runs over
+ * loopback to a container; managed providers need DB_SSL=true.
+ *
+ * DB_SSL_REJECT_UNAUTHORIZED=false exists for providers that present a
+ * self-signed certificate. It weakens the connection, so it is opt-in and
+ * reported by configWarnings().
+ */
+const sslEnabled = /^(1|true|yes|require)$/i.test(process.env.DB_SSL ?? "");
+const sslRejectUnauthorized = !/^(0|false|no)$/i.test(
+  process.env.DB_SSL_REJECT_UNAUTHORIZED ?? "",
+);
+const sslConfig = sslEnabled
+  ? Object.freeze({ rejectUnauthorized: sslRejectUnauthorized })
+  : false;
+
 /**
  * Origins permitted by CORS.
  *
@@ -84,11 +178,26 @@ export const config = Object.freeze({
   backendRoot: BACKEND_ROOT,
 
   database: Object.freeze({
-    // Absolute, or relative to the backend root.
-    path: path.resolve(
-      BACKEND_ROOT,
-      process.env.DATABASE_PATH || "studypal.db",
-    ),
+    /**
+     * PostgreSQL connection string. Under NODE_ENV=test the test-only variable
+     * is required and DATABASE_URL is ignored entirely, so `npm test` cannot
+     * reach the developer's working database even by accident.
+     */
+    url: databaseUrl,
+    /** Same URL with the password replaced — the only form safe to log. */
+    safeUrl: redactUrl(databaseUrl),
+    /** Parsed for messages and for the test-database safety check. */
+    name: databaseName(databaseUrl),
+    ssl: sslConfig,
+    pool: Object.freeze({
+      /** Small on purpose: SQLite had one writer, and Node is single-threaded. */
+      max: int("DB_POOL_MAX", 10),
+      idleTimeoutMillis: int("DB_IDLE_TIMEOUT_MS", 30_000),
+      /** Fail a request rather than queue forever behind an unreachable host. */
+      connectionTimeoutMillis: int("DB_CONNECT_TIMEOUT_MS", 5_000),
+    }),
+    /** Guard for destructive test setup; see tests/helpers/test-database.mjs. */
+    isTestUrl: looksLikeTestDatabase(databaseUrl),
   }),
 
   cors: Object.freeze({
@@ -144,6 +253,28 @@ export function configWarnings() {
     warnings.push(
       "CORS is open to all origins. Set FRONTEND_URL or CORS_ORIGINS " +
         "(comma-separated) to restrict it.",
+    );
+  }
+
+  if (config.isProduction && !config.database.ssl) {
+    warnings.push(
+      "Database TLS is disabled (DB_SSL is unset) while NODE_ENV=production. " +
+        "Credentials and student data cross the network in the clear unless the " +
+        "connection is already inside a private network or a local socket.",
+    );
+  }
+
+  if (config.database.ssl && !config.database.ssl.rejectUnauthorized) {
+    warnings.push(
+      "DB_SSL_REJECT_UNAUTHORIZED=false — the database certificate is not " +
+        "verified, so TLS protects against passive eavesdropping only.",
+    );
+  }
+
+  if (config.isProduction && config.database.isTestUrl) {
+    warnings.push(
+      `Database "${config.database.name}" is named like a test database while ` +
+        "NODE_ENV=production. Check DATABASE_URL points where you intend.",
     );
   }
 

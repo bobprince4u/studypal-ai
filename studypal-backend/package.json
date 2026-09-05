@@ -6,7 +6,7 @@
     "studypal",
     "education",
     "express",
-    "sqlite",
+    "postgresql",
     "gemini"
   ],
   "license": "ISC",
@@ -16,17 +16,21 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "migrate": "node scripts/migrate.mjs up",
+    "migrate:status": "node scripts/migrate.mjs status",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
     "test": "node --test \"tests/**/*.test.js\"",
     "test:baseline": "node --test \"tests/baseline/**/*.test.js\"",
     "characterize": "node tests/characterize.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.46.0",
-    "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "multer": "^2.1.1",
-    "pdf-parse": "^2.4.5"
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.23.0"
   }
 }
