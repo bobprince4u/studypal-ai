@@ -49,6 +49,13 @@ export function testUser(prefix = "test") {
  *                                Node resolves a module's imports from its own
  *                                location, so an entrypoint in /tmp cannot find
  *                                express or better-sqlite3.
+ *
+ *                                For the pre-refactor server, put it one level
+ *                                down (.baseline/server.mjs). That server
+ *                                hardcoded `new Database(path.join(__dirname,
+ *                                "studypal.db"))` and ignored DATABASE_PATH, so
+ *                                running it from the backend root writes test
+ *                                rows into the real studypal.db.
  * @param {object} [opts.env]     extra environment variables
  */
 export async function startServer(opts = {}) {

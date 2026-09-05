@@ -22,5 +22,5 @@ uploads/
 # ── OS ─────────────────────────────────
 .DS_Store
 Thumbs.db
-# ── Baseline replay scratch file ───────
-.baseline-server.mjs
+# ── Baseline replay scratch directory ──
+.baseline/

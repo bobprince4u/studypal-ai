@@ -128,13 +128,20 @@ Two suites, with different jobs:
   evidence rather than assertion. To replay it:
 
   ```bash
-  git show 634c9d8:studypal-backend/server.js > .baseline-server.mjs
-  STUDYPAL_ENTRY=.baseline-server.mjs npm run test:baseline   # 35 pass
-  rm .baseline-server.mjs
+  mkdir -p .baseline
+  git show 634c9d8:studypal-backend/server.js > .baseline/server.mjs
+  STUDYPAL_ENTRY=.baseline/server.mjs npm run test:baseline   # 35 pass
+  rm -rf .baseline
   ```
 
-  The extracted file has to sit inside this directory — Node resolves a module's
-  imports from its own location, so a copy in `/tmp` cannot find `express`.
+  The subdirectory matters in both directions. The extracted file has to sit
+  somewhere under this directory, because Node resolves a module's imports from
+  its own location and a copy in `/tmp` cannot find `express`. But it must not
+  sit in this directory itself: the pre-refactor server hardcoded
+  `new Database(path.join(__dirname, "studypal.db"))` and ignored
+  `DATABASE_PATH`, so running it from the backend root writes ~57 rows of test
+  data straight into your real `studypal.db`. One level down, `__dirname` is
+  `.baseline/` and the throwaway database goes there with it.
 
 - **`tests/hardening.test.js`** (24) — the changes SP-V2-001 introduced
   deliberately. Each test maps to a numbered row in `docs/api-contract.md` §7.
