@@ -6,8 +6,11 @@
 > [`tests/characterize.mjs`](../tests/characterize.mjs)), not from the README —
 > the README was inaccurate in several places, which is itself recorded below.
 >
-> **[Section 16](#16-architecture-after-sp-v2-001) describes the architecture as
-> it is now**, after the refactor.
+> **[Section 16](#16-architecture-after-sp-v2-001)** describes what SP-V2-001
+> changed, and **[Section 17](#17-architecture-after-sp-v2-002) describes the
+> architecture as it is now**, after the PostgreSQL migration. Where the two
+> disagree — the storage layer, the test strategy, the file tree — §17 is current
+> and §16 is the record of an earlier state.
 >
 > The baseline sections are kept rather than overwritten because the problem
 > inventory in §9–§11 is referenced by number (`A1`…`A18`) from
@@ -208,6 +211,13 @@ questions and a placeholder topic, indistinguishable from a real answer.
 ---
 
 ## 6. Database schema
+
+> **Baseline, superseded.** This is the SQLite schema as it stood at `634c9d8`.
+> SP-V2-002 replaced it; the current schema is
+> [`database-architecture.md`](./database-architecture.md), and the DDL below is
+> kept unexecuted at `migrations/legacy-sqlite/001_initial_schema.sql`. Every
+> "Observation" in this section is a problem that schema had, and each is
+> addressed in [§17.1](#171-what-changed).
 
 SQLite via `better-sqlite3` (synchronous, in-process). File:
 `studypal-backend/studypal.db`, `journal_mode = WAL`.
@@ -429,14 +439,17 @@ Ordered by how much it blocks V2.
    refactor is safe. — *addressed by SP-V2-001.*
 3. **`answer` as a JSON blob + no indexes.** Weak-area detection and analytics
    need to query practice-question outcomes and topics relationally.
-   — *deferred to SP-V2-002.*
+   — *deferred to SP-V2-002; **done there** — JSONB plus two justified indexes.*
 4. **No migration mechanism.** Any schema change is currently a manual
    `ALTER TABLE` against a live file. — *partially addressed (a `migrations/`
-   home is created); real tooling deferred to SP-V2-002.*
+   home is created); real tooling deferred to SP-V2-002, **done there** —
+   `src/db/migrator.js`.*
 5. **No auth / user model.** Analytics per student and any notion of ownership
-   require real identity. — *explicitly out of scope for SP-V2-001.*
+   require real identity. — *explicitly out of scope for SP-V2-001. SP-V2-002
+   added the `users` table auth will attach to; **auth itself is still open** (S1).*
 6. **SQLite single-file, in-process.** No concurrent writers, no vector support.
-   — *SP-V2-002 (PostgreSQL/pgvector).*
+   — *SP-V2-002 (PostgreSQL/pgvector). **PostgreSQL done**; pgvector deliberately
+   not installed until the RAG ticket needs it.*
 7. **Uploads are transient.** Files are discarded after one request, so RAG over
    study material is impossible without a document store. — *deferred to the RAG
    phase.*
@@ -508,7 +521,9 @@ origins, the Gemini model, the upload limit or the log level.
 - `better-sqlite3` is a **native module**, and the SQLite file is local state —
   the backend as written cannot run on a stateless/serverless platform without
   changing the storage layer. This is a constraint on SP-V2-002, not a defect
-  today.
+  today. *(Resolved: SP-V2-002 moved storage to a PostgreSQL server and removed
+  `better-sqlite3`. There is no native module and no local state left — see
+  [§17](#17-architecture-after-sp-v2-002).)*
 - Local database artefacts (`studypal.db`, `-shm`, `-wal`) are git-ignored. The
   working tree currently contains orphaned `studypal.db-shm` / `studypal.db-wal`
   files, which is harmless local cruft.
@@ -528,8 +543,14 @@ The baseline suite added by SP-V2-001 is described in
 
 # 16. Architecture after SP-V2-001
 
-Everything above this line describes the pre-refactor system. Everything below
-describes the system as it stands now.
+Everything above this line describes the pre-refactor system. This section
+describes what the SP-V2-001 refactor changed.
+
+> **This section is a historical record, not the current state.** SP-V2-002
+> replaced the storage layer, so every statement here about SQLite, `migrations/`
+> and the test counts was true when written and is superseded by
+> [§17](#17-architecture-after-sp-v2-002). The layer rules (§16.3) and the request
+> path (§16.4) are still accurate.
 
 **Nothing about the product changed.** No feature was added, removed or
 redesigned; the frontend was not touched apart from a lockfile security update;
@@ -710,3 +731,159 @@ Called out so nobody mistakes these for oversights:
 | RAG study-material chat | upload handling already isolated in `upload.service`, so extraction is one module to extend | a vector store — needs the PostgreSQL/pgvector decision explicitly deferred by SP-V2-001 |
 | Learning analytics / weak-area detection | `question.repository` already aggregates topics for `/api/progress` | richer schema (per-question correctness), which needs the migration runner |
 | Any per-student feature | — | **authentication (S1)** — currently a username is an unverified claim, so nothing private can be built on it |
+
+*(That table was written before SP-V2-002. The migration runner, the vector-store
+decision and the schema seam now exist — see [§17.7](#177-readiness-for-v2-features)
+for the current version.)*
+
+---
+
+# 17. Architecture after SP-V2-002
+
+SP-V2-002 replaced the storage layer. SQLite is gone; PostgreSQL is the
+authoritative database, reached through `pg` with no ORM, no query builder and no
+migration framework.
+
+**No endpoint changed.** `tests/baseline/contract.test.js` — the 35 tests that
+also pass against the pre-refactor `server.js` — passes unmodified against
+PostgreSQL. That is the evidence the swap was invisible to the frontend, which
+was not touched at all.
+
+## 17.1 What changed
+
+| | After SP-V2-001 | After SP-V2-002 |
+| --- | --- | --- |
+| Database | SQLite file, `better-sqlite3` (native, in-process, synchronous) | PostgreSQL 16 server, `pg` (pooled, async) |
+| Schema creation | `CREATE TABLE IF NOT EXISTS` on every boot | `npm run migrate`, tracked and checksummed. A running server never mutates DDL |
+| Tables | `sessions`, `questions` (no relationship) | `users`, `questions` (FK + `ON DELETE CASCADE`), `schema_migrations` |
+| Identity | `questions.username TEXT` — a repeated string, no constraint | `questions.user_id BIGINT REFERENCES users(id)` |
+| `answer` | `TEXT` holding JSON; `JSON.parse` on every read | `JSONB`; comes back as an object, no parse anywhere |
+| `has_file` | `INTEGER` 0/1, wrapped in `Boolean()` on read | `BOOLEAN` |
+| Constraints | `UNIQUE(username)` only | 3 CHECKs, 2 UNIQUEs, 1 FK, 2 identity columns |
+| Indexes on `questions` | none (A9) | 2, each serving a query in the code, each justified in the migration |
+| Instances | one (a file cannot have two writers) | many |
+| Test isolation | a temp SQLite file per run | a PostgreSQL database cloned from a migrated template per suite, under an advisory lock |
+| Tests | 59 (35 contract + 24 hardening) | 99 (35 contract + 26 hardening + 12 migrations + 26 schema) |
+| Runtime dependencies | `better-sqlite3` among 6 | `pg`; `better-sqlite3` removed |
+
+```
+┌──────────────────────────┐         ┌───────────────────────────┐        ┌──────────────┐
+│  studypal-frontend       │  HTTP   │  studypal-backend         │  HTTPS │  Google      │
+│  Next.js 16 (App Router) │ ──────► │  Express 5, layered       │ ─────► │  Gemini API  │
+│  unchanged               │  JSON / │  localhost:4000           │        │              │
+└──────────────────────────┘  multi- └───────────┬───────────────┘        └──────────────┘
+                              part               │ pg — one pool per process
+                                                 ▼
+                                    PostgreSQL 16 (127.0.0.1:5434 locally)
+                                    users ──1:N──► questions
+```
+
+## 17.2 What was added
+
+```
+studypal-backend/
+├── compose.yaml                     PostgreSQL 16 on 127.0.0.1:5434, no default password
+├── scripts/migrate.mjs              CLI: `up` and `status`
+├── migrations/
+│   ├── postgres/001_core_schema.sql the applied schema, forward-only
+│   └── legacy-sqlite/               the old schema, moved, never executed
+├── src/
+│   ├── config/
+│   │   ├── database.js              the pool, query(), withTransaction(), health probe
+│   │   └── pg-types.js              BIGINT → number, TIMESTAMPTZ → ISO string
+│   ├── db/migrator.js               the runner
+│   └── repositories/
+│       └── user.repository.js       renamed from session.repository.js
+├── tests/
+│   ├── migrations.test.js           12 — the runner against real PostgreSQL
+│   ├── schema.test.js               26 — the constraints, via SQL not HTTP
+│   └── helpers/test-database.mjs    per-suite database provisioning + the guard
+└── docs/database-architecture.md    schema, indexes, migrations, connections
+```
+
+`src/repositories/session.repository.js` became `user.repository.js`, following
+the table. Everything else under `src/` kept its name; the layer rules in §16.3
+are unchanged and still hold.
+
+## 17.3 Two decisions worth knowing about
+
+**pg's type parsers are process-global.** `types.setTypeParser` mutates a
+process-wide registry, not a pool. `COUNT(*)` is `BIGINT`, which pg renders as a
+*string*, and `TIMESTAMPTZ` becomes a `Date` — both visible API changes
+(`total_questions: "3"`, and a `created_at` failing the contract's
+`new Date(x).toISOString() === x`). The parsers therefore live in their own module
+that every entrypoint opening a pool calls, rather than as an import side effect
+of `database.js`. Anything that opens its own client and skips it silently reads
+different shapes.
+
+**Transactions are used deliberately, not everywhere.** A lone INSERT or SELECT is
+already atomic; wrapping it costs two round trips for nothing. There are exactly
+two callers of `withTransaction()`: `POST /api/ask` (upsert the user, then insert
+the question — two statements that must not come apart) and each migration file.
+
+## 17.4 Failure behaviour
+
+| Failure | Behaviour |
+| --- | --- |
+| `DATABASE_URL` unset | Fatal before the listener opens. A deployment mistake must not start and pretend to work. |
+| `NODE_ENV=test` and `STUDYPAL_TEST_DATABASE_URL` unset | Fatal, and deliberately not defaulted to `DATABASE_URL` — the suite recreates schemas. |
+| PostgreSQL unreachable | Server starts. `GET /health` → `503 degraded`; data endpoints → 500. |
+| Migrations pending | Warning at startup; the server serves. |
+| An applied migration was edited | Error logged at startup; `npm run migrate` refuses. |
+
+An unreachable database is transient and a process that exits on it crash-loops,
+which recovers no faster and produces worse logs. A missing connection string is
+not transient, so that one is fatal.
+
+## 17.5 Status of A8, A9 and A11
+
+The three baseline findings SP-V2-001 explicitly deferred to this ticket:
+
+| | Was | Now |
+| --- | --- | --- |
+| **A8** no migrations | *Partially fixed* — the schema was recorded in a file nothing executed, and the app created its own tables on boot | **Fixed.** `src/db/migrator.js` + `npm run migrate`: ordered, tracked, checksummed, transactional, forward-only. The server no longer creates tables. 12 tests |
+| **A9** no indexes on `questions` | *Deferred* — the index was written out and commented, unexecuted | **Fixed.** `idx_questions_user_created` and `idx_questions_user_topic`. `tests/schema.test.js` asserts `EXPLAIN` actually uses both at a few thousand rows — an index the planner declines to use is the same as no index |
+| **A11** `answer` an opaque JSON blob | *Deferred* — needed queryable before analytics | **Fixed.** `JSONB`, with a CHECK that it is an object. The `topic` field is denormalised into its own indexed column because it is the one field queried rather than displayed |
+
+Still open from that list, unchanged by this ticket: **A10** (silent AI
+degradation, preserved deliberately), **A17** (the frontend ignores HTTP status),
+**A18/S1** (no authentication). **S7** (no rate limiting) remains the
+highest-value security gap.
+
+## 17.6 What is deliberately still simple
+
+- **No ORM, no query builder.** Nine SQL statements across two repositories. An
+  ORM would add a dependency, a mapping layer and a second thing to learn.
+- **No migration framework.** What node-pg-migrate or Knex adds beyond
+  `src/db/migrator.js` is a rollback DSL, a JS migration format and a CLI. None
+  is wanted.
+- **Forward-only migrations.** No `down`, and no fake rollback. A down migration
+  that has never run is untested code executed for the first time during an
+  incident, and a genuinely destructive migration is a restore-from-backup
+  problem either way.
+- **No pgvector, no Redis, no extension beyond `plpgsql`.** Asserted by a test, so
+  adding one is a deliberate act rather than a drift.
+- **Only the two tables the code reads.** The nine tables the V2 features will
+  need are named in a test that fails if one is created early — a table nothing
+  reads is a guess about a requirement, not a schema.
+- **No connection retry or backoff.** A blip surfaces as one 500; the pool
+  recovers on the next request.
+
+## 17.7 Readiness for V2 features
+
+| V2 feature | What exists for it now | What it still needs |
+| --- | --- | --- |
+| Study Plan Generator | `users.id` to hang plans off; the migration runner; the repository pattern | `study_plans` / `study_plan_tasks` migration, `plan.service`, `plan.repository`, a prompt |
+| Exam Simulator | same, plus JSONB for storing generated question sets and the three-tier JSON repair | `exams` / `exam_questions` / `exam_attempts` / `attempt_answers`, timing and scoring |
+| RAG study-material chat | the PostgreSQL decision is made and the server is running; `upload.service` already isolates extraction | `CREATE EXTENSION vector`, a `materials` / `material_chunks` migration, an embedding call, an HNSW index |
+| Learning analytics | `questions` is relational and indexed by user; `topic` is a real column | `learning_events`, and per-question correctness — which the exam work produces |
+| Real accounts | `users` with unique username, a nullable-unique `email`, and `display_name` / `education_level` already in place | `password_hash`, `email_verified_at`, a real `sessions` table, and the product decision about what an account is (S1) |
+| Horizontal scaling | PostgreSQL is a server; multiple instances are fine | a shared store for rate limiting (S7), if that is per-user rather than per-IP |
+
+Everything above attaches to `users.id`, which is why this ticket introduced a
+surrogate key rather than continuing to key `questions` on a username string.
+Each is a new numbered file in `migrations/postgres/`; the existing one is
+immutable.
+
+Schema, index justifications, connection management and the test-database
+strategy in full: [`database-architecture.md`](./database-architecture.md).

@@ -1,15 +1,24 @@
 # StudyPal — API Contract
 
 > **Status.** This is the contract as **measured** against the pre-refactor
-> `server.js` at commit `634c9d8`, and re-verified against the refactored backend
-> at the end of SP-V2-001. Every status code and body below was observed, not
-> inferred from reading the source.
+> `server.js` at commit `634c9d8`, re-verified against the refactored backend at
+> the end of SP-V2-001, and re-verified again on PostgreSQL at the end of
+> SP-V2-002. Every status code and body below was observed, not inferred from
+> reading the source.
 >
 > Reproduce with: `node tests/characterize.mjs` (dumps raw responses) or
 > `npm test` (asserts them).
 >
 > A short list of **deliberate, documented deviations** introduced by SP-V2-001
 > is at the end (§7). Everything not listed there is byte-for-byte unchanged.
+>
+> **SP-V2-002 added no deviation.** It replaced SQLite with PostgreSQL and
+> changed no endpoint: the 35 baseline tests that pass against the pre-refactor
+> `server.js` pass unmodified against the PostgreSQL backend. Two response
+> *values* are worth naming because they were at risk and are now pinned by
+> tests: `total_questions` is a JSON **number** (`BIGINT` renders as a string by
+> default in `pg`) and every `created_at` is the same ISO-8601 string form as
+> before (`TIMESTAMPTZ` yields a `Date` by default). See §8.
 
 - Base URL: `http://localhost:4000` (override with `PORT`)
 - Frontend base URL: `process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000"`
@@ -23,10 +32,12 @@
 
 ### `AnswerObject`
 
-What `POST /api/ask` returns and what is stored (serialised) in
-`questions.answer`. **The server does not validate these fields** — it guarantees
-only that the value is a JSON object. The keys below are what the prompt asks the
-model for, and what the frontend reads.
+What `POST /api/ask` returns and what is stored in `questions.answer` (a `JSONB`
+column since SP-V2-002 — the object itself, no longer a serialised string).
+**The server does not validate these fields** — the `questions_answer_is_object`
+CHECK constraint guarantees only that the value is a JSON object, never that any
+particular key is present (recorded as S16 in `security-baseline.md`). The keys
+below are what the prompt asks the model for, and what the frontend reads.
 
 ```ts
 {
@@ -276,11 +287,11 @@ descending:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `question` | string | As submitted. |
-| `answer` | object | The stored blob, **re-parsed**. If it fails to parse, becomes `{ "explanation": "<raw string>" }` — note this form has no `topic`/`practice_questions`/`encouragement`. |
+| `answer` | object | Since SP-V2-002, read straight out of the `JSONB` column — nothing parses it, so the "fails to parse" case that produced `{ "explanation": "<raw string>" }` on read no longer exists. A degraded answer is still *written* in that shape by the AI repair path, so the same value can still appear; it just cannot be produced by reading. |
 | `topic` | string | Denormalised column, defaults to `"Study Topic"`. |
-| `has_file` | **boolean** | Converted from the `0`/`1` INTEGER column. |
+| `has_file` | **boolean** | A real `BOOLEAN` column since SP-V2-002; was converted from `0`/`1`. Same JSON output. |
 | `filename` | string \| null | Client-supplied original filename. |
-| `created_at` | string | ISO-8601. |
+| `created_at` | string | ISO-8601, e.g. `2026-09-05T00:37:34.958Z`. A `TIMESTAMPTZ` column normalised to this exact form by `src/config/pg-types.js`; the contract test asserts `new Date(created_at).toISOString() === created_at`. |
 
 ### Errors
 
@@ -334,8 +345,8 @@ breakdown).
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `total_questions` | number | `COUNT(*)` over all of the user's questions — not capped. |
-| `topics` | array | Top **6** topics by count, descending. Always present. |
+| `total_questions` | number | `COUNT(*)` over all of the user's questions — not capped. A JSON **number**, not a string: `COUNT(*)` is `BIGINT` and `pg` renders that as a string by default, so `src/config/pg-types.js` registers an `INT8` parser. Asserted by the contract test. |
+| `topics` | array | Top **6** topics by count, descending. Always present. `count` is a number, for the same reason. Ties now break alphabetically by topic — under SQLite equally-frequent topics came back in scan order, so this is deterministic where it used to be merely stable in practice. |
 
 ### Errors
 
@@ -379,8 +390,24 @@ Initial state is `{ total_questions: 0, topics: [] }`. The component reads
 not contact Gemini** — a healthy API must not report itself unhealthy because a
 third-party AI provider is degraded.
 
-Returns `503` with `"status": "degraded"` only if the local database is
-unreachable.
+### Response `503`
+
+Returned when the database is unreachable:
+
+```json
+{
+  "status": "degraded",
+  "uptime_seconds": 12,
+  "version": "1.0.0",
+  "database": "unavailable"
+}
+```
+
+Since SP-V2-002 this is how a database outage is reported. The server starts even
+if PostgreSQL is unreachable, so an orchestrator sees a service saying what is
+wrong rather than a container restart loop. `database` is the bare string
+`"unavailable"` — never the driver error, which would name the host, port and
+user to an unauthenticated caller. The detail is logged instead.
 
 ### Frontend usage
 
