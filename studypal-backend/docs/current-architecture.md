@@ -1,14 +1,21 @@
-# StudyPal — Current Architecture (pre-V2 baseline)
+# StudyPal — Architecture
 
-> **Scope.** This document describes the system **as it exists at the start of
-> SP-V2-001**, before any refactoring. It is written from the actual source code
-> and from measured black-box behaviour (see
+> **How to read this document.** Sections 1–15 describe the system **as it
+> existed at the start of SP-V2-001**, before any refactoring. They are written
+> from the actual source code and from measured black-box behaviour (see
 > [`tests/characterize.mjs`](../tests/characterize.mjs)), not from the README —
-> the README is inaccurate in several places, which is itself recorded below.
+> the README was inaccurate in several places, which is itself recorded below.
 >
-> It is **not** a description of the intended V2 architecture.
+> **[Section 16](#16-architecture-after-sp-v2-001) describes the architecture as
+> it is now**, after the refactor.
+>
+> The baseline sections are kept rather than overwritten because the problem
+> inventory in §9–§11 is referenced by number (`A1`…`A18`) from
+> [`api-contract.md`](./api-contract.md) and
+> [`security-baseline.md`](./security-baseline.md), and because the measured
+> "before" behaviour is the evidence that the refactor preserved it.
 
-- Commit characterized: `634c9d8` (branch `feature/studypal-v2-baseline`)
+- Baseline characterized at: `634c9d8` (branch `feature/studypal-v2-baseline`)
 - Node.js: v22.21.1, npm 11.8.0
 - Date: 2026-09-05
 
@@ -516,3 +523,181 @@ server and never terminates.
 
 The baseline suite added by SP-V2-001 is described in
 [`api-contract.md`](./api-contract.md) and lives in `tests/`.
+
+---
+
+# 16. Architecture after SP-V2-001
+
+Everything above this line describes the pre-refactor system. Everything below
+describes the system as it stands now.
+
+**Nothing about the product changed.** No feature was added, removed or
+redesigned; the frontend was not touched apart from a lockfile security update;
+the database file, schema and contents are unchanged. What changed is where the
+code lives and what each part is allowed to know.
+
+## 16.1 What the refactor actually changed
+
+| | Before | After |
+| --- | --- | --- |
+| Backend source files | 1 (`server.js`, 199 lines) | 22 under `src/` + a 45-line `server.js` |
+| Layers | none — routing, validation, SQL, prompt assembly, HTTP calls and error handling all interleaved in each route handler | routes → controllers → services → repositories, with AI isolated behind its own client |
+| Testability | none possible: `app.listen()` and `new GoogleGenAI()` ran as import side effects, and `app` was never exported | `createApp()` returns an unstarted app; the Gemini client is built lazily |
+| Modules reading `process.env` | 4 places, scattered | 1 (`src/config/env.js`) |
+| Modules importing `@google/genai` | 1 (the whole server) | 1 (`src/ai/gemini.client.js`) — and nothing above the service layer can reach it |
+| SQL statement sites | 6, inline in route handlers | 6, all in `src/repositories/` |
+| Error handling | per-route `try/catch` on one route, nothing anywhere else | one central handler; layers throw, the boundary formats |
+| Tests | 0 | 59 (35 contract + 24 hardening) |
+
+## 16.2 Directory layout
+
+```
+studypal-backend/
+├── server.js                  process entrypoint: warn, open DB, listen, shut down
+├── src/
+│   ├── app.js                 Express assembly + middleware order
+│   ├── config/
+│   │   ├── env.js             the only reader of process.env; frozen config object
+│   │   └── database.js        SQLite connection, schema bootstrap, health probe
+│   ├── routes/
+│   │   ├── index.js           the route table — which prefixes exist
+│   │   ├── health.routes.js
+│   │   ├── session.routes.js
+│   │   └── questions.routes.js
+│   ├── controllers/           HTTP in, HTTP out — no SQL, no Gemini, no try/catch
+│   │   ├── health.controller.js
+│   │   ├── session.controller.js
+│   │   └── questions.controller.js
+│   ├── services/              use cases; the only layer that orchestrates
+│   │   ├── session.service.js
+│   │   ├── question.service.js     ask / history / progress
+│   │   ├── ai.service.js           prompt → provider → parse
+│   │   └── upload.service.js       file → model parts
+│   ├── repositories/          the only modules that know SQL exists
+│   │   ├── session.repository.js
+│   │   └── question.repository.js
+│   ├── ai/
+│   │   ├── gemini.client.js   the ONLY importer of @google/genai
+│   │   └── prompts/
+│   │       └── study-question.prompt.js   the prompt, verbatim
+│   ├── middleware/
+│   │   ├── cors.js            environment-driven origin policy
+│   │   ├── error-handler.js   central handler + JSON 404 + asyncHandler
+│   │   ├── request-logger.js
+│   │   ├── security-headers.js
+│   │   ├── upload.js          multer config, limits, extension allowlist
+│   │   └── validation.js      per-endpoint input checks
+│   └── utils/
+│       ├── app-error.js       AppError + status helpers
+│       ├── logger.js          level-aware console wrapper
+│       └── version.js         package.json version, read once
+├── migrations/
+│   └── 001_initial_schema.sql the current schema, recorded (no runner yet)
+├── tests/
+│   ├── baseline/contract.test.js   35 tests — must pass before AND after
+│   ├── hardening.test.js           24 tests — the intended changes
+│   ├── characterize.mjs            behaviour probe
+│   └── helpers/
+│       ├── fake-gemini.mjs         global-fetch stub, no API key needed
+│       └── server-harness.mjs      spawns the server on an ephemeral port
+└── docs/
+    ├── current-architecture.md     this file
+    ├── api-contract.md             every endpoint + §7 deliberate deviations
+    └── security-baseline.md        protections, findings, fixes, deferrals
+```
+
+## 16.3 Layer rules
+
+Four rules, each mechanically checkable:
+
+1. **Controllers do not contain SQL, prompts, or provider calls.** They read
+   `req.validated`, call one service, and send the result.
+2. **Services do not touch `req` or `res`.** They take and return plain data, so
+   they are callable from a test, a script or a future job queue.
+3. **Only `src/repositories/` knows SQL.** Only `src/ai/gemini.client.js` imports
+   `@google/genai`. Only `src/config/env.js` reads `process.env`.
+4. **Layers throw; only the boundary formats.** No layer below `src/middleware/`
+   sets a status code or writes a response body.
+
+Verified with:
+
+```bash
+grep -rn "GoogleGenAI\|generateContent" src/controllers src/routes   # empty
+grep -rln "@google/genai" src/            # gemini.client.js only (as an import)
+grep -rln "process\.env" src/             # config/env.js only
+grep -rnE "\breq\.|\bres\.[a-z]" src/services src/repositories        # empty
+```
+
+## 16.4 Request path
+
+`POST /api/ask` — the most involved route — now reads end to end as:
+
+```
+app.js
+  requestLogger → securityHeaders → cors → express.json
+routes/index.js            /api → questions.routes.js
+questions.routes.js        acceptOptionalFile → validateAskRequest → asyncHandler(ask)
+  middleware/upload.js       multer: size + count limits, extension allowlist
+  middleware/validation.js   username + question present; trimmed value attached
+controllers/questions.controller.js   ask(): three lines
+services/question.service.js          askQuestion(): orchestration
+  services/upload.service.js            file → inlineData or extracted text
+  services/ai.service.js                prompt assembly, then parse (3 tiers)
+    ai/prompts/study-question.prompt.js   the prompt text
+    ai/gemini.client.js                   the only generateContent() call
+  repositories/question.repository.js   INSERT — only after the model answered
+→ res.json(answer)                      returned verbatim, no envelope
+```
+
+On any throw, control skips to `middleware/error-handler.js`, which logs the
+full error and responds with JSON carrying a client-safe message.
+
+## 16.5 Status of the pre-refactor problems (A1–A18)
+
+| | Status |
+| --- | --- |
+| A1 no separation of concerns | **Fixed** — §16.2 |
+| A2 untestable (side effects at import) | **Fixed** — `createApp()`; 59 tests |
+| A3 no error handling strategy | **Fixed** — central handler |
+| A4 stack traces leaked | **Fixed** — S2 in security-baseline |
+| A5 no input validation | **Fixed** — `middleware/validation.js` |
+| A6 no upload limits or type checks | **Fixed** — S4, S5 |
+| A7 CORS wide open | **Fixed** (configurable; permissive default retained deliberately) — S6 |
+| A8 no health endpoint | **Fixed** — `GET /health` |
+| A9 no index on `questions.username` | **Deferred to SP-V2-002** — schema preservation was required; recorded in `migrations/001_initial_schema.sql` |
+| A10 no migrations | **Partially** — `migrations/` exists with the schema recorded; a runner is SP-V2-002 |
+| A11 prompt embedded in a route handler | **Fixed** — `src/ai/prompts/` |
+| A12 `.env` vs `.env.local` mismatch | **Fixed** — S11 |
+| A13 `PORT=your_port` in `.env.example` | **Fixed** — S11; numeric env vars now validated |
+| A14 README documents directories that do not exist | **Fixed** — READMEs rewritten |
+| A15 `main: "index.js"`, `"test": "npm run dev"` | **Fixed** — `main: "server.js"`, real test scripts |
+| A16 no logging | **Fixed** — S13 |
+| A17 frontend ignores HTTP status on `/api/ask` | **Not fixed — backend accommodates it.** The frontend was out of scope, so `/api/ask` error bodies are guaranteed to stay JSON objects with an `error` key. Worth fixing in the frontend later. |
+| A18 username is identity, no auth | **Deferred by instruction** — S1; the largest remaining gap |
+
+## 16.6 What is deliberately still simple
+
+Called out so nobody mistakes these for oversights:
+
+- **SQLite, no ORM, no query builder.** Required by SP-V2-001 and still the right
+  call at this size. Repositories keep the swap contained if it ever happens.
+- **No dependency injection container.** Modules import their collaborators
+  directly. At 22 files with one implementation each, a container would add
+  indirection and remove nothing.
+- **No DTO/mapper layer.** Repositories return rows; services shape them once.
+  A mapping layer would be two more files restating the same field names.
+- **Schema DDL still applied on boot** rather than by a migration runner. Same
+  idempotent `CREATE TABLE IF NOT EXISTS` as before; a runner arrives with the
+  data-layer work.
+- **Zero new runtime dependencies.** `package.json` dependencies are byte-identical
+  to the pre-refactor list.
+
+## 16.7 Readiness for V2 features
+
+| V2 feature | What now exists for it | What it still needs |
+| --- | --- | --- |
+| Study Plan Generator | prompt directory, `ai.service` seam, repository pattern to copy | `plan.service`, `plan.repository`, a prompt, a migration |
+| Exam Simulator | same, plus the three-tier JSON repair to reuse for structured output | `exam.*` layers, timing/scoring rules |
+| RAG study-material chat | upload handling already isolated in `upload.service`, so extraction is one module to extend | a vector store — needs the PostgreSQL/pgvector decision explicitly deferred by SP-V2-001 |
+| Learning analytics / weak-area detection | `question.repository` already aggregates topics for `/api/progress` | richer schema (per-question correctness), which needs the migration runner |
+| Any per-student feature | — | **authentication (S1)** — currently a username is an unverified claim, so nothing private can be built on it |
