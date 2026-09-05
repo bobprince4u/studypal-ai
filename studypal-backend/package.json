@@ -18,7 +18,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "npm run dev"
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:baseline": "node --test \"tests/baseline/**/*.test.js\"",
+    "characterize": "node tests/characterize.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.46.0",
