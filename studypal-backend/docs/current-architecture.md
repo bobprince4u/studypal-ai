@@ -654,26 +654,35 @@ full error and responds with JSON carrying a client-safe message.
 
 ## 16.5 Status of the pre-refactor problems (A1–A18)
 
+Numbering and wording follow the findings table in §9. Security-only issues are
+numbered S1–S15 in [`security-baseline.md`](./security-baseline.md) and are
+cross-referenced here rather than renumbered.
+
 | | Status |
 | --- | --- |
-| A1 no separation of concerns | **Fixed** — §16.2 |
-| A2 untestable (side effects at import) | **Fixed** — `createApp()`; 59 tests |
-| A3 no error handling strategy | **Fixed** — central handler |
-| A4 stack traces leaked | **Fixed** — S2 in security-baseline |
-| A5 no input validation | **Fixed** — `middleware/validation.js` |
-| A6 no upload limits or type checks | **Fixed** — S4, S5 |
-| A7 CORS wide open | **Fixed** (configurable; permissive default retained deliberately) — S6 |
-| A8 no health endpoint | **Fixed** — `GET /health` |
-| A9 no index on `questions.username` | **Deferred to SP-V2-002** — schema preservation was required; recorded in `migrations/001_initial_schema.sql` |
-| A10 no migrations | **Partially** — `migrations/` exists with the schema recorded; a runner is SP-V2-002 |
-| A11 prompt embedded in a route handler | **Fixed** — `src/ai/prompts/` |
-| A12 `.env` vs `.env.local` mismatch | **Fixed** — S11 |
-| A13 `PORT=your_port` in `.env.example` | **Fixed** — S11; numeric env vars now validated |
-| A14 README documents directories that do not exist | **Fixed** — READMEs rewritten |
-| A15 `main: "index.js"`, `"test": "npm run dev"` | **Fixed** — `main: "server.js"`, real test scripts |
-| A16 no logging | **Fixed** — S13 |
-| A17 frontend ignores HTTP status on `/api/ask` | **Not fixed — backend accommodates it.** The frontend was out of scope, so `/api/ask` error bodies are guaranteed to stay JSON objects with an `error` key. Worth fixing in the frontend later. |
-| A18 username is identity, no auth | **Deferred by instruction** — S1; the largest remaining gap |
+| A1 no separation of concerns | **Fixed** — §16.2; the layer rules and the greps that check them |
+| A2 not testable (`listen()` and `new GoogleGenAI()` at import, `app` never exported) | **Fixed** — `createApp()` in `src/app.js`; 59 tests |
+| A3 AI provider not abstracted | **Fixed** — `src/ai/gemini.client.js` is the only `@google/genai` importer |
+| A4 prompt is inline | **Fixed** — `src/ai/prompts/study-question.prompt.js`, text unchanged |
+| A5 no error-handling middleware (HTML + stack trace on a throw) | **Fixed** — `src/middleware/error-handler.js`; see S2 |
+| A6 no validation layer (non-string `username` → `TypeError` → 500) | **Fixed** — `src/middleware/validation.js`; now 400 |
+| A7 config read inline and unvalidated; a missing API key undetected at startup | **Fixed** — `src/config/env.js` is the only `process.env` reader, and `configWarnings()` logs a missing key at startup |
+| A8 no migrations | **Partially fixed** — `migrations/001_initial_schema.sql` records the schema; the app still creates its own tables and there is no runner. Runner deferred to SP-V2-002 |
+| A9 no indexes on `questions` | **Deferred to SP-V2-002** — preserving the schema was a constraint of this ticket. The index is written out, commented, in `migrations/001_initial_schema.sql` |
+| A10 silent AI degradation (unparseable output → 200 + placeholder) | **Not fixed — deliberately preserved.** Changing it would change `/api/ask` responses, which this ticket forbids. It is now pinned by a characterization test rather than being accidental, and the fallback is logged |
+| A11 `answer` stored as an opaque JSON blob | **Deferred to SP-V2-002** — the analytics features need it queryable, and changing it means a data migration |
+| A12 `dotenv/config` reads `.env` but the repo ships `.env.local` | **Fixed** — both are loaded, `.env.local` first; see S11 |
+| A13 `.env.example` unusable (`PORT=your_port`) | **Fixed** — all fifteen variables documented with real defaults, and numeric variables are now validated at startup |
+| A14 README documents directories that do not exist | **Fixed** — root README rewritten, backend README added |
+| A15 `package.json` metadata wrong (`main: "index.js"`, `"test": "npm run dev"`) | **Fixed** — `main: "server.js"`, real `test`/`test:baseline`/`characterize` scripts |
+| A16 no request logging | **Fixed** — `src/middleware/request-logger.js`; see S13 |
+| A17 frontend ignores HTTP status on `/api/ask` | **Not fixed — the backend accommodates it.** The frontend was out of scope, so `/api/ask` error bodies are guaranteed to stay JSON objects with an `error` key. Worth fixing in the frontend later |
+| A18 username-as-identity, no auth | **Deferred by instruction** — S1; the largest remaining gap |
+
+Also delivered here, though not A-numbered because they came from the ticket
+rather than from the baseline read: `GET /health` (checks the database, never
+calls Gemini), configurable CORS (S6), upload size and type limits (S4, S5),
+security response headers (S10), and graceful shutdown (S14).
 
 ## 16.6 What is deliberately still simple
 
