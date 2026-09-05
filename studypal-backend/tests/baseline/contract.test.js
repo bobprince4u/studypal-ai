@@ -26,9 +26,6 @@
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
 
 import {
   startServer,
@@ -37,23 +34,19 @@ import {
 } from "../helpers/server-harness.mjs";
 import { CANNED_ANSWER } from "../helpers/fake-gemini.mjs";
 
-/** A throwaway database directory, honoured by the refactored backend. */
-let dbDir;
-async function serverEnv(extra = {}) {
-  dbDir ??= await mkdtemp(path.join(tmpdir(), "studypal-test-"));
-  return { DATABASE_PATH: path.join(dbDir, "test.db"), ...extra };
-}
-
 describe("baseline contract", () => {
   let srv;
 
   before(async () => {
-    srv = await startServer({ env: await serverEnv() });
+    // The harness provisions a private, migrated PostgreSQL database per server
+    // and drops it in stop(). Before SP-V2-002 this passed a DATABASE_PATH into
+    // a temp directory; the isolation requirement is the same, the mechanism is
+    // not. See tests/helpers/test-database.mjs.
+    srv = await startServer({ label: "contract" });
   });
 
   after(async () => {
     await srv?.stop();
-    if (dbDir) await rm(dbDir, { recursive: true, force: true });
   });
 
   // ────────────────────────────────────────────────────────────────────────
@@ -473,7 +466,8 @@ describe("baseline contract", () => {
 describe("AI response repair", () => {
   test("parses JSON wrapped in ```json fences", async () => {
     const srv = await startServer({
-      env: await serverEnv({ FAKE_GEMINI_MODE: "fenced" }),
+      label: "fenced",
+      env: { FAKE_GEMINI_MODE: "fenced" },
     });
     try {
       const res = await srv.request("POST", "/api/ask", {
@@ -488,7 +482,8 @@ describe("AI response repair", () => {
 
   test("falls back to the placeholder answer for non-JSON output", async () => {
     const srv = await startServer({
-      env: await serverEnv({ FAKE_GEMINI_MODE: "prose" }),
+      label: "prose",
+      env: { FAKE_GEMINI_MODE: "prose" },
     });
     try {
       const username = testUser();
@@ -520,7 +515,8 @@ describe("AI response repair", () => {
   for (const mode of ["http-error", "network-error"]) {
     test(`returns 500 {error} when the AI ${mode === "http-error" ? "rejects the request" : "is unreachable"}`, async () => {
       const srv = await startServer({
-        env: await serverEnv({ FAKE_GEMINI_MODE: mode }),
+        label: mode,
+        env: { FAKE_GEMINI_MODE: mode },
       });
       try {
         const username = testUser();

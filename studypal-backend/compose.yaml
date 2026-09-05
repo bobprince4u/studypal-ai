@@ -1,0 +1,39 @@
+# Local development PostgreSQL for StudyPal.
+#
+#   docker compose up -d
+#   docker compose down          # keeps the volume
+#   docker compose down -v       # deletes the data
+#
+# Port 5434 on the host, not 5432, so this does not collide with a system
+# PostgreSQL or another project's container. The container's own port is
+# unchanged, so DATABASE_URL inside a container network would still use 5432.
+#
+# The password comes from the environment and is NOT committed. Copy
+# .env.example to .env first: docker compose reads .env from this directory,
+# and so does the backend, so one file configures both.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: studypal-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-studypal}
+      POSTGRES_USER: ${POSTGRES_USER:-studypal}
+      # No default: `docker compose up` fails loudly if it is unset rather than
+      # silently creating a cluster with a password someone guessed from a repo.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in studypal-backend/.env}
+    volumes:
+      - studypal_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -q so the check does not write the connection banner into the logs.
+      test: ["CMD-SHELL", "pg_isready -q -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  studypal_pgdata:

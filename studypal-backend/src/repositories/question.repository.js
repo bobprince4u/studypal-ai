@@ -1,99 +1,129 @@
 /**
  * Question / answer persistence.
  *
- * SQL is lifted verbatim from server.js:137-147, 158-162 and 184-191 — same
- * columns, same ORDER BY, same LIMITs (now sourced from config so they are
- * visible and tunable, with defaults equal to the previous hardcoded 30 and 6).
+ * Ported to PostgreSQL in SP-V2-002. The queries mean the same things they did
+ * under SQLite — same columns, same ORDER BY, same LIMITs from config — with two
+ * changes the schema forced:
  *
- * Every statement is parameterised; no value is ever concatenated into SQL.
+ *   • rows are keyed by `user_id`, not by a repeated `username` string
+ *   • `answer` is JSONB, so it goes in as an object and comes back as one; the
+ *     service no longer JSON.parses on every read
+ *
+ * Every value is a bind parameter. `username`, `question`, `topic`, `filename`
+ * and the model's output are all user- or model-controlled and none of them is
+ * ever concatenated into SQL.
  */
 
-import { getDatabase } from "../config/database.js";
-
-const cache = new Map();
-
-function stmt(sql) {
-  let prepared = cache.get(sql);
-  if (!prepared) {
-    prepared = getDatabase().prepare(sql);
-    cache.set(sql, prepared);
-  }
-  return prepared;
-}
+import { query } from "../config/database.js";
 
 /**
  * Persist one answered question.
  *
- * NOTE: `username` and `question` are stored exactly as the client sent them,
- * untrimmed. That is what the pre-refactor server did, and history responses
- * echo these values back, so trimming here would be a visible API change.
+ * NOTE: `question` is stored exactly as the client sent it, untrimmed. That is
+ * what the pre-refactor server did and GET /api/history echoes it back, so
+ * trimming here would be a visible API change.
  *
  * @param {object} record
- * @param {string} record.username
+ * @param {number} record.userId FK into users.id
  * @param {string} record.question
- * @param {string} record.answer serialised answer JSON
+ * @param {object} record.answer the answer OBJECT, not a JSON string
  * @param {string} record.topic
  * @param {boolean} record.hasFile
  * @param {string|null} record.filename
- * @param {string} record.createdAt ISO-8601 timestamp
+ * @param {import("pg").PoolClient} [client] run on this client, to join a
+ *   transaction the caller already opened
  */
-export function insert({
-  username,
-  question,
-  answer,
-  topic,
-  hasFile,
-  filename,
-  createdAt,
-}) {
-  stmt(
-    `INSERT INTO questions (username, question, answer, topic, has_file, filename, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    username,
+export async function insert(
+  { userId, question, answer, topic, hasFile, filename },
+  client,
+) {
+  const sql = `
+    INSERT INTO questions (user_id, question, answer, topic, has_file, filename)
+    VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+  `;
+  // JSON.stringify is how a JS object is sent as jsonb — pg has no object
+  // encoder. Postgres parses it back into jsonb on receipt, so the column holds
+  // an object, NOT a JSON-encoded string. The questions_answer_is_object CHECK
+  // constraint fails loudly if that ever stops being true.
+  const values = [
+    userId,
     question,
-    answer,
+    JSON.stringify(answer),
     topic,
-    hasFile ? 1 : 0,
+    hasFile,
     filename,
-    createdAt,
-  );
+  ];
+
+  // `created_at` is left to the column's `DEFAULT now()` rather than being sent
+  // from Node: the database's clock is the one consistent source of ordering
+  // across processes.
+  if (client) await client.query(sql, values);
+  else await query(sql, values);
 }
 
 /**
  * Most recent questions first.
- * @param {string} username
+ *
+ * Ordering is `created_at DESC, id DESC`. The tie-break is new: `now()` has
+ * microsecond resolution but two inserts inside the same statement-level
+ * timestamp would otherwise come back in an arbitrary order, and the contract
+ * tests assert a strict newest-first sequence over three rapid inserts. `id` is
+ * monotonic, so it settles ties by actual insertion order.
+ *
+ * Uses idx_questions_user_created.
+ *
+ * @param {number} userId
  * @param {number} limit
- * @returns {Array<{question: string, answer: string, topic: string, has_file: number, filename: string|null, created_at: string}>}
+ * @returns {Promise<Array<{question: string, answer: object, topic: string, has_file: boolean, filename: string|null, created_at: string}>>}
  */
-export function findRecentByUsername(username, limit) {
-  return stmt(
-    `SELECT question, answer, topic, has_file, filename, created_at FROM questions WHERE username = ? ORDER BY created_at DESC LIMIT ?`,
-  ).all(username, limit);
+export async function findRecentByUserId(userId, limit) {
+  const { rows } = await query(
+    `SELECT question, answer, topic, has_file, filename, created_at
+       FROM questions
+      WHERE user_id = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT $2`,
+    [userId, limit],
+  );
+  return rows;
 }
 
 /**
- * @param {string} username
- * @returns {number}
+ * @param {number} userId
+ * @returns {Promise<number>} a number, not pg's default bigint string — the
+ *   INT8 parser in src/config/pg-types.js handles that process-wide
  */
-export function countByUsername(username) {
-  return stmt("SELECT COUNT(*) as c FROM questions WHERE username = ?").get(
-    username,
-  ).c;
+export async function countByUserId(userId) {
+  const { rows } = await query(
+    "SELECT COUNT(*) AS c FROM questions WHERE user_id = $1",
+    [userId],
+  );
+  return rows[0].c;
 }
 
 /**
  * Topic frequency, most asked first.
- * @param {string} username
+ *
+ * `ORDER BY count DESC, topic ASC` — the alphabetical tie-break is new. Under
+ * SQLite equally-frequent topics came back in whatever order the scan produced;
+ * naming the second key makes the response deterministic instead of merely
+ * stable-in-practice.
+ *
+ * Uses idx_questions_user_topic.
+ *
+ * @param {number} userId
  * @param {number} limit
- * @returns {Array<{topic: string, count: number}>}
+ * @returns {Promise<Array<{topic: string, count: number}>>}
  */
-export function countTopicsByUsername(username, limit) {
-  return stmt(
-    `SELECT topic, COUNT(*) as count FROM questions WHERE username = ? GROUP BY topic ORDER BY count DESC LIMIT ?`,
-  ).all(username, limit);
-}
-
-/** Drop cached statements — required after the connection is closed. */
-export function resetStatementCache() {
-  cache.clear();
+export async function countTopicsByUserId(userId, limit) {
+  const { rows } = await query(
+    `SELECT topic, COUNT(*) AS count
+       FROM questions
+      WHERE user_id = $1
+      GROUP BY topic
+      ORDER BY count DESC, topic ASC
+      LIMIT $2`,
+    [userId, limit],
+  );
+  return rows;
 }

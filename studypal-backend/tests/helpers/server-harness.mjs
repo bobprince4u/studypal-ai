@@ -11,6 +11,12 @@
  *
  * Set STUDYPAL_ENTRY to point the harness at a different entrypoint (used to
  * replay the baseline against the original server.js after refactoring).
+ *
+ * Since SP-V2-002 each started server also gets its own migrated PostgreSQL
+ * database, provisioned by tests/helpers/test-database.mjs and dropped by
+ * `stop()`. That replaces the per-test SQLite file the old harness relied on:
+ * `DATABASE_PATH` no longer means anything, and the isolation it provided for
+ * free now has to be arranged explicitly.
  */
 
 import { spawn } from "node:child_process";
@@ -19,6 +25,8 @@ import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { createIsolatedDatabase } from "./test-database.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const BACKEND_ROOT = path.resolve(HERE, "..", "..");
@@ -48,21 +56,30 @@ export function testUser(prefix = "test") {
  *                                root. Must live INSIDE the backend directory:
  *                                Node resolves a module's imports from its own
  *                                location, so an entrypoint in /tmp cannot find
- *                                express or better-sqlite3.
- *
- *                                For the pre-refactor server, put it one level
- *                                down (.baseline/server.mjs). That server
- *                                hardcoded `new Database(path.join(__dirname,
- *                                "studypal.db"))` and ignored DATABASE_PATH, so
- *                                running it from the backend root writes test
- *                                rows into the real studypal.db.
- * @param {object} [opts.env]     extra environment variables
+ *                                express or pg.
+ * @param {object} [opts.env]     extra environment variables. Setting
+ *                                STUDYPAL_TEST_DATABASE_URL here overrides the
+ *                                private database this harness would otherwise
+ *                                create — used only by the tests that need a
+ *                                specific database.
+ * @param {string} [opts.label]   short name for the private database, so a
+ *                                leftover one is traceable to its suite
+ * @param {boolean} [opts.database=true] set false to start the server with NO
+ *                                reachable database, for the degraded-health test
  */
 export async function startServer(opts = {}) {
   const entry = opts.entry || process.env.STUDYPAL_ENTRY || "server.js";
   // resolve() rather than join() so an absolute entry is honoured as given.
   const entryPath = path.resolve(BACKEND_ROOT, entry);
   const port = await freePort();
+
+  // Each server gets a private, already-migrated database unless the caller
+  // supplies its own connection string. Under NODE_ENV=test the app reads only
+  // STUDYPAL_TEST_DATABASE_URL, so this is the whole of the wiring.
+  let database = null;
+  if (opts.database !== false && !opts.env?.STUDYPAL_TEST_DATABASE_URL) {
+    database = await createIsolatedDatabase({ label: opts.label ?? "srv" });
+  }
 
   const child = spawn(
     process.execPath,
@@ -75,6 +92,7 @@ export async function startServer(opts = {}) {
         // The fake never validates the key, but the SDK requires one to exist.
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || "fake-key-for-tests",
         NODE_ENV: "test",
+        ...(database ? { STUDYPAL_TEST_DATABASE_URL: database.url } : {}),
         ...opts.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -92,6 +110,9 @@ export async function startServer(opts = {}) {
   const deadline = Date.now() + 20_000;
   for (;;) {
     if (child.exitCode !== null) {
+      // Drop the private database before throwing, or a failing start leaks one
+      // per attempt and the server eventually runs out of databases.
+      await database?.drop().catch(() => {});
       throw new Error(
         `server exited early (code ${child.exitCode})\n` +
           `--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
@@ -102,6 +123,7 @@ export async function startServer(opts = {}) {
       break; // any HTTP response (incl. 404) means it is listening
     } catch {
       if (Date.now() > deadline) {
+        await database?.drop().catch(() => {});
         throw new Error(
           `server did not start within 20s\n` +
             `--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
@@ -147,6 +169,9 @@ export async function startServer(opts = {}) {
     port,
     base,
     request,
+    /** Connection string of this server's private database, if it has one. */
+    databaseUrl: database?.url ?? null,
+    databaseName: database?.name ?? null,
     get stdout() {
       return stdout;
     },
@@ -154,9 +179,14 @@ export async function startServer(opts = {}) {
       return stderr;
     },
     async stop() {
-      if (child.exitCode !== null) return;
-      child.kill("SIGKILL");
-      await once(child, "exit");
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await once(child, "exit");
+      }
+      // Dropped after the process is gone: PostgreSQL will not drop a database
+      // that still has a connected client, and SIGKILL leaves the backends to be
+      // reaped, hence WITH (FORCE) inside drop().
+      await database?.drop().catch(() => {});
     },
   };
 }

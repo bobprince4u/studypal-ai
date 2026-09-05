@@ -8,12 +8,23 @@
  */
 
 import * as questions from "../repositories/question.repository.js";
+import * as users from "../repositories/user.repository.js";
 import { config } from "../config/env.js";
+import { withTransaction } from "../config/database.js";
 import { answerStudyQuestion } from "./ai.service.js";
 import { buildAttachmentParts } from "./upload.service.js";
 
 /**
  * Answer a study question and record it.
+ *
+ * The user row is created on demand. /api/ask has never required a prior
+ * /api/session call and still does not; under the old schema `questions` simply
+ * carried a username string, and with a foreign key the user has to exist first.
+ *
+ * The username is used VERBATIM, untrimmed — see src/middleware/validation.js.
+ * `/api/session` trims, `/api/ask` does not, so "ann" and "ann " are two
+ * different users. That asymmetry predates this iteration and the history
+ * responses depend on it; it is recorded as debt rather than changed here.
  *
  * @param {object} input
  * @param {string} input.username stored verbatim
@@ -24,18 +35,36 @@ import { buildAttachmentParts } from "./upload.service.js";
 export async function askQuestion({ username, question, file }) {
   const attachmentParts = file ? await buildAttachmentParts(file) : [];
 
+  // Before any write: a failed generation must leave the database untouched,
+  // including leaving no empty user behind.
   const answer = await answerStudyQuestion({ question, attachmentParts });
 
-  questions.insert({
-    username,
-    question,
-    answer: JSON.stringify(answer),
-    // The prompt forbids "General", but a malformed response may omit `topic`
-    // entirely; the column default is the same string.
-    topic: answer.topic || "Study Topic",
-    hasFile: Boolean(file),
-    filename: file ? file.originalname : null,
-    createdAt: new Date().toISOString(),
+  // One of the few places a transaction is warranted. The upsert and the insert
+  // are two statements that must both land or neither: a committed user with no
+  // question is harmless but wrong, and a question needs its user's id to exist.
+  await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `INSERT INTO users (username)
+            VALUES ($1)
+       ON CONFLICT (username)
+       DO UPDATE SET username = EXCLUDED.username
+         RETURNING id`,
+      [username],
+    );
+
+    await questions.insert(
+      {
+        userId: rows[0].id,
+        question,
+        answer,
+        // The prompt forbids "General", but a malformed response may omit
+        // `topic` entirely; the column default is the same string.
+        topic: answer.topic || "Study Topic",
+        hasFile: Boolean(file),
+        filename: file ? file.originalname : null,
+      },
+      client,
+    );
   });
 
   return answer;
@@ -44,32 +73,33 @@ export async function askQuestion({ username, question, file }) {
 /**
  * Recent questions for a student, newest first.
  *
- * Answers are stored as JSON text. Rows written before that convention — or
- * corrupted by hand — are wrapped as `{explanation: <raw text>}` so the client
- * always receives the same shape and never has to parse anything itself.
+ * An unknown username yields an empty array rather than an error, and does not
+ * create the user — reading a URL must not write a row.
  *
  * @param {string} username
- * @returns {Array<object>} always an array; the frontend maps over it unguarded
+ * @returns {Promise<Array<object>>} always an array; the frontend maps over it
+ *   unguarded
  */
-export function getHistory(username) {
-  return questions
-    .findRecentByUsername(username, config.limits.historyItems)
-    .map((row) => ({
-      question: row.question,
-      answer: parseStoredAnswer(row.answer),
-      topic: row.topic,
-      has_file: Boolean(row.has_file),
-      filename: row.filename,
-      created_at: row.created_at,
-    }));
-}
+export async function getHistory(username) {
+  const userId = await users.findIdByUsername(username);
+  if (userId === undefined) return [];
 
-function parseStoredAnswer(stored) {
-  try {
-    return JSON.parse(stored);
-  } catch {
-    return { explanation: stored };
-  }
+  const rows = await questions.findRecentByUserId(
+    userId,
+    config.limits.historyItems,
+  );
+
+  return rows.map((row) => ({
+    question: row.question,
+    // JSONB: already an object. The old code JSON.parsed a TEXT column here and
+    // needed a try/catch for rows that were not valid JSON — a state the
+    // questions_answer_is_object CHECK constraint now makes unrepresentable.
+    answer: row.answer,
+    topic: row.topic,
+    has_file: row.has_file,
+    filename: row.filename,
+    created_at: row.created_at,
+  }));
 }
 
 /**
@@ -80,14 +110,18 @@ function parseStoredAnswer(stored) {
  * always be an array.
  *
  * @param {string} username
- * @returns {{total_questions: number, topics: Array<{topic: string, count: number}>}}
+ * @returns {Promise<{total_questions: number, topics: Array<{topic: string, count: number}>}>}
  */
-export function getProgress(username) {
-  return {
-    total_questions: questions.countByUsername(username),
-    topics: questions.countTopicsByUsername(
-      username,
-      config.limits.progressTopics,
-    ),
-  };
+export async function getProgress(username) {
+  const userId = await users.findIdByUsername(username);
+  if (userId === undefined) return { total_questions: 0, topics: [] };
+
+  // Two independent reads on the same user; issued together rather than in
+  // sequence so the endpoint costs one round trip's latency, not two.
+  const [total_questions, topics] = await Promise.all([
+    questions.countByUserId(userId),
+    questions.countTopicsByUserId(userId, config.limits.progressTopics),
+  ]);
+
+  return { total_questions, topics };
 }

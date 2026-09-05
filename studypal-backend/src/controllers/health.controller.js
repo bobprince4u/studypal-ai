@@ -1,18 +1,22 @@
 /**
  * GET /health
  *
- * Checks only what this process owns: is the SQLite file readable? It does NOT
+ * Checks only what this process owns: can it reach PostgreSQL? It does NOT
  * contact Gemini. A liveness probe that depends on a third-party API would take
  * the service out of rotation whenever that API had a bad minute, and would
  * spend quota on every poll.
+ *
+ * Since SP-V2-002 this is the mechanism by which a database outage is reported:
+ * the server starts even if PostgreSQL is unreachable, and says so here with a
+ * 503 rather than crash-looping. See docs/database-architecture.md.
  */
 
 import { checkDatabaseHealth } from "../config/database.js";
 import { logger } from "../utils/logger.js";
 import { version } from "../utils/version.js";
 
-export function health(_req, res) {
-  const database = checkDatabaseHealth();
+export async function health(_req, res) {
+  const database = await checkDatabaseHealth();
 
   if (!database.ok) {
     // Logged with detail; the response says only that the check failed.

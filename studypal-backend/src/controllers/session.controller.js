@@ -7,7 +7,7 @@
 
 import * as sessionService from "../services/session.service.js";
 
-export function createSession(req, res) {
+export async function createSession(req, res) {
   const { username } = req.validated;
-  res.json(sessionService.startSession(username));
+  res.json(await sessionService.startSession(username));
 }

@@ -7,21 +7,27 @@
  * as A18 in docs/current-architecture.md and as the top item in
  * docs/security-baseline.md, because any client can read any student's history
  * by guessing a name.
+ *
+ * SP-V2-002 moved the storage from a `sessions` table to `users`, which is where
+ * authentication will eventually attach. The response is unchanged.
  */
 
-import * as sessions from "../repositories/session.repository.js";
+import * as users from "../repositories/user.repository.js";
 
 /**
- * Create the session if needed and return it.
+ * Create the user if needed and return the session view of them.
  *
  * Idempotent: logging in twice returns the original `created_at` rather than
- * resetting it, because the insert ignores conflicts on the unique username.
+ * resetting it, because the upsert leaves an existing row's timestamps alone.
+ *
+ * Returns only `username` and `created_at`. `users.id` is deliberately not
+ * exposed: the frontend never reads it, and the response key set is asserted
+ * exactly by the contract tests.
  *
  * @param {string} username already validated and trimmed
- * @returns {{username: string, created_at: string}}
+ * @returns {Promise<{username: string, created_at: string}>}
  */
-export function startSession(username) {
-  sessions.insertIfAbsent(username, new Date().toISOString());
-  const session = sessions.findByUsername(username);
-  return { username: session.username, created_at: session.created_at };
+export async function startSession(username) {
+  const user = await users.upsert(username);
+  return { username: user.username, created_at: user.created_at };
 }
