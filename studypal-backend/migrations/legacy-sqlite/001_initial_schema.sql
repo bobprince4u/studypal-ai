@@ -1,13 +1,30 @@
--- StudyPal initial schema
+-- StudyPal initial schema — SQLITE, HISTORICAL. NOT EXECUTED.
 --
--- This is the schema the pre-refactor server created inline at startup
--- (server.js:21-37), recorded here unchanged as the baseline for real
--- migration tooling in SP-V2-002.
+-- ┌──────────────────────────────────────────────────────────────────────────┐
+-- │ SUPERSEDED by SP-V2-002. The live schema is migrations/postgres/, which   │
+-- │ the runner (`npm run migrate`) applies to PostgreSQL. Nothing in this     │
+-- │ directory is ever run by anything; it is kept only as the record of what  │
+-- │ the database looked like before the port.                                 │
+-- └──────────────────────────────────────────────────────────────────────────┘
 --
--- It is NOT executed by a migration runner yet: src/config/database.js still
--- applies the same idempotent DDL on boot, exactly as before. Introducing a
--- runner (and a schema_migrations table) is deliberately out of scope for
--- SP-V2-001, whose remit is to change structure without changing behaviour.
+-- Written during SP-V2-001, where it was at migrations/001_initial_schema.sql.
+-- It was moved rather than edited in place or renumbered, because SP-V2-002 is
+-- instructed not to overwrite the historical meaning of an existing migration:
+-- `001` here means "the original SQLite tables", and `001` under
+-- migrations/postgres/ means "the initial PostgreSQL schema". Two different
+-- statements, so they live in two different directories rather than fighting
+-- over one filename.
+--
+-- The DDL below is the schema the pre-refactor server created inline at startup
+-- (server.js:21-37), recorded unchanged. It was never applied by a runner —
+-- src/config/database.js executed the equivalent idempotent DDL on boot.
+--
+-- Differences from the PostgreSQL schema that replaced it are set out in
+-- docs/database-architecture.md; in brief: `sessions` became `users` with a real
+-- primary key, `questions.username` became a `user_id` foreign key,
+-- `answer` moved from an escaped TEXT blob to JSONB, `created_at TEXT` became
+-- TIMESTAMPTZ, `has_file INTEGER` became BOOLEAN, and the index that this file
+-- deferred now exists.
 
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,13 +43,15 @@ CREATE TABLE IF NOT EXISTS questions (
   created_at TEXT NOT NULL
 );
 
--- Deferred to SP-V2-002, not applied here:
+-- Deferred by SP-V2-001, not applied here:
 --
 --   CREATE INDEX IF NOT EXISTS idx_questions_username_created
 --     ON questions (username, created_at DESC);
 --
--- Every history and progress query filters on `questions.username` and none of
--- them can use an index today, so each one is a full table scan. The fix is a
--- one-line index, but SP-V2-001 is instructed to preserve the schema unless a
--- change is strictly necessary, and this one is a performance improvement
--- rather than a necessity. It belongs with the data-layer work in SP-V2-002.
+-- Every history and progress query filtered on `questions.username` and none of
+-- them could use an index, so each one was a full table scan. SP-V2-001 was
+-- instructed to preserve the schema unless a change was strictly necessary, and
+-- this was a performance improvement rather than a necessity.
+--
+-- RESOLVED in SP-V2-002: migrations/postgres/001_core_schema.sql creates the
+-- equivalent index on (user_id, created_at DESC).
