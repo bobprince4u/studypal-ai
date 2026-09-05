@@ -24,5 +24,15 @@ questionRoutes.post(
   asyncHandler(ask),
 );
 
-questionRoutes.get("/history/:username", validateUsernameParam, history);
-questionRoutes.get("/progress/:username", validateUsernameParam, progress);
+// Both are async since the PostgreSQL port: a rejected query must reach the
+// error handler as a JSON 500, not surface as an unhandled rejection.
+questionRoutes.get(
+  "/history/:username",
+  validateUsernameParam,
+  asyncHandler(history),
+);
+questionRoutes.get(
+  "/progress/:username",
+  validateUsernameParam,
+  asyncHandler(progress),
+);

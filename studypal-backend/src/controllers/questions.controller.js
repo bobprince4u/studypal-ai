@@ -23,10 +23,10 @@ export async function ask(req, res) {
   res.json(answer);
 }
 
-export function history(req, res) {
-  res.json(questionService.getHistory(req.validated.username));
+export async function history(req, res) {
+  res.json(await questionService.getHistory(req.validated.username));
 }
 
-export function progress(req, res) {
-  res.json(questionService.getProgress(req.validated.username));
+export async function progress(req, res) {
+  res.json(await questionService.getProgress(req.validated.username));
 }

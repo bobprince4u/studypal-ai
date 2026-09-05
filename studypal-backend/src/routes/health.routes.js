@@ -8,7 +8,10 @@
 import { Router } from "express";
 
 import { health } from "../controllers/health.controller.js";
+import { asyncHandler } from "../middleware/error-handler.js";
 
 export const healthRoutes = Router();
 
-healthRoutes.get("/health", health);
+// Async since the PostgreSQL port. The handler catches its own database error
+// and reports 503, so this is for anything unexpected around it.
+healthRoutes.get("/health", asyncHandler(health));
