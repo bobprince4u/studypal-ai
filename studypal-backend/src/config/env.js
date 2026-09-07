@@ -13,6 +13,7 @@
  */
 
 import dotenv from "dotenv";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,6 +59,41 @@ function list(name) {
 }
 
 const nodeEnv = process.env.NODE_ENV || "development";
+
+// ── storage directory ─────────────────────────────────────────────────────────
+
+/**
+ * Where uploaded materials are written.
+ *
+ * Resolved against BACKEND_ROOT rather than process.cwd(): the server can be
+ * started from anywhere, and a relative path that moved with the working
+ * directory would silently split one deployment's uploads across two
+ * directories. An absolute STUDYPAL_STORAGE_DIR is honoured as given, which is
+ * how a deployment points this at a mounted volume.
+ *
+ * The default is `<backend>/data/uploads` — outside every source directory and
+ * excluded by .gitignore, so uploads can never be committed and are never mixed
+ * in with code.
+ *
+ * Nothing is created here. Reading configuration must not have filesystem side
+ * effects; src/storage/local-storage.service.js creates the directory when it
+ * first needs to write, which is also the only place that touches the disk.
+ */
+function resolveStorageDir() {
+  const raw = process.env.STUDYPAL_STORAGE_DIR?.trim();
+  if (raw) return path.resolve(BACKEND_ROOT, raw);
+
+  // Under NODE_ENV=test the default moves out of the repository entirely, for
+  // the same reason STUDYPAL_TEST_DATABASE_URL is mandatory: a test run must not
+  // be able to write into a developer's real data even if the harness forgets to
+  // configure it. The suite sets this variable explicitly per server; this is
+  // the backstop if something ever does not.
+  if (nodeEnv === "test") {
+    return path.join(os.tmpdir(), "studypal-test-uploads");
+  }
+
+  return path.join(BACKEND_ROOT, "data", "uploads");
+}
 
 // ── database URL ──────────────────────────────────────────────────────────────
 
@@ -177,6 +213,14 @@ export const config = Object.freeze({
 
   backendRoot: BACKEND_ROOT,
 
+  storage: Object.freeze({
+    /**
+     * Absolute directory holding uploaded materials. Always absolute, always
+     * outside the source tree, never created as a side effect of reading config.
+     */
+    dir: resolveStorageDir(),
+  }),
+
   database: Object.freeze({
     /**
      * PostgreSQL connection string. Under NODE_ENV=test the test-only variable
@@ -230,6 +274,33 @@ export const config = Object.freeze({
     progressTopics: int("PROGRESS_TOPICS_LIMIT", 6),
     /** Characters of extracted document text forwarded to the model. */
     documentTextChars: int("DOCUMENT_TEXT_CHARS", 4000),
+
+    /**
+     * Maximum size of an uploaded study material, in bytes.
+     *
+     * Separate from `uploadBytes` (which bounds a /api/ask attachment) because
+     * the two endpoints have different jobs: an attachment is inlined into one
+     * prompt, whereas a material is stored, extracted and chunked. They share
+     * the same 10 MB default, so nothing changes unless a deployment sets this
+     * — but a deployment that wants 50 MB textbooks should not have to raise the
+     * limit on prompt attachments to get them.
+     */
+    materialUploadBytes: int(
+      "MAX_MATERIAL_BYTES",
+      int("MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
+    ),
+
+    /** Items returned by GET /api/materials. */
+    materialListItems: int("MATERIAL_LIST_LIMIT", 100),
+
+    /**
+     * Longest `original_filename` accepted. Matches the
+     * materials_original_filename_bounded CHECK constraint in
+     * migrations/postgres/002_materials.sql — validation rejects an over-long
+     * name with a useful message, the constraint stops a code path that skips
+     * validation.
+     */
+    materialFilenameLength: int("MAX_MATERIAL_FILENAME_LENGTH", 512),
   }),
 
   logLevel: process.env.LOG_LEVEL || (nodeEnv === "test" ? "silent" : "info"),
