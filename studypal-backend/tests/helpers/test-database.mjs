@@ -343,9 +343,20 @@ async function templateIsCurrent(pool, migrationStatus) {
     const { rows } = await pool.query(
       `SELECT to_regclass('public.schema_migrations') IS NOT NULL AS tracked,
               to_regclass('public.users') IS NOT NULL AS has_users,
-              to_regclass('public.questions') IS NOT NULL AS has_questions`,
+              to_regclass('public.questions') IS NOT NULL AS has_questions,
+              to_regclass('public.materials') IS NOT NULL AS has_materials,
+              to_regclass('public.material_chunks') IS NOT NULL AS has_chunks`,
     );
-    if (!rows[0].tracked || !rows[0].has_users || !rows[0].has_questions) {
+    if (
+      !rows[0].tracked ||
+      !rows[0].has_users ||
+      !rows[0].has_questions ||
+      // SP-V2-003's tables. Listed here as well as checked by migrationStatus
+      // below because a template created before this migration existed would
+      // otherwise look "current" on the strength of its recorded rows alone.
+      !rows[0].has_materials ||
+      !rows[0].has_chunks
+    ) {
       return false;
     }
 
@@ -357,7 +368,10 @@ async function templateIsCurrent(pool, migrationStatus) {
     // A template with rows in it would copy them into every clone, and the
     // suites assert on empty tables.
     const { rows: counts } = await pool.query(
-      "SELECT (SELECT COUNT(*) FROM users) + (SELECT COUNT(*) FROM questions) AS total",
+      `SELECT (SELECT COUNT(*) FROM users)
+            + (SELECT COUNT(*) FROM questions)
+            + (SELECT COUNT(*) FROM materials)
+            + (SELECT COUNT(*) FROM material_chunks) AS total`,
     );
     return Number(counts[0].total) === 0;
   } catch {

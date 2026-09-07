@@ -82,7 +82,12 @@ describe("migrate() on a fresh database", () => {
     );
     assert.deepEqual(result.skipped, []);
 
+    // Every table both migrations create, in the order tableNames() returns
+    // them. Exact rather than a subset: a migration that quietly created an
+    // extra table would otherwise pass.
     assert.deepEqual(await tableNames(pool), [
+      "material_chunks",
+      "materials",
       "questions",
       "schema_migrations",
       "users",
