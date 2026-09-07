@@ -94,12 +94,16 @@ real environment variable beating both. Neither file is committed.
 | `FRONTEND_URL`, `CORS_ORIGINS` | unset | See below. |
 | `GEMINI_MODEL` | `gemini-3-flash-preview` | |
 | `AI_TIMEOUT_MS` | `0` (off) | Abort a generation after this long. |
-| `MAX_UPLOAD_BYTES` | `10485760` (10 MB) | |
+| `MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Attachment limit for `POST /api/ask`. |
+| `STUDYPAL_STORAGE_DIR` | `./data/uploads` | Where uploaded study materials are written. Relative paths resolve against **this directory**, not `process.cwd()`. Ignored under `NODE_ENV=test`. |
+| `MAX_MATERIAL_BYTES` | `MAX_UPLOAD_BYTES` | Upload limit for `POST /api/materials`, separate so raising one does not raise the other. |
+| `MATERIAL_LIST_LIMIT` | `100` | Items from `/api/materials`. |
+| `MAX_MATERIAL_FILENAME_LENGTH` | `512` | Longest accepted original filename. |
 | `JSON_BODY_LIMIT` | `100kb` | |
 | `MAX_USERNAME_LENGTH` | `200` | |
 | `HISTORY_LIMIT` | `30` | Items from `/api/history`. |
 | `PROGRESS_TOPICS_LIMIT` | `6` | Topics from `/api/progress`. |
-| `DOCUMENT_TEXT_CHARS` | `4000` | Characters of an uploaded document sent to the model. |
+| `DOCUMENT_TEXT_CHARS` | `4000` | Characters of an uploaded document sent to the model. Unrelated to material chunking, whose size and overlap are module constants rather than env vars. |
 
 ### CORS
 
@@ -124,6 +128,11 @@ allowed regardless, so configuring a deployment does not break local work.
 | `POST` | `/api/ask` | multipart `username`, `question`, optional `file` | `200` — the answer object |
 | `GET` | `/api/history/:username` | — | `200` — array, newest first, ≤ `HISTORY_LIMIT` |
 | `GET` | `/api/progress/:username` | — | `200 {total_questions, topics[]}` |
+| `POST` | `/api/materials` | multipart `username`, `file` | `201` — the material |
+| `GET` | `/api/materials` | `?username=` | `200` — array, newest first, ≤ `MATERIAL_LIST_LIMIT` |
+| `GET` | `/api/materials/:id` | `?username=` | `200` — the material |
+| `GET` | `/api/materials/:id/status` | `?username=` | `200 {id, status, pageCount, chunkCount}` |
+| `DELETE` | `/api/materials/:id` | `?username=` | `200 {id, deleted: true}` |
 
 Errors are always JSON: `{"error": "<message>"}`.
 
@@ -141,17 +150,48 @@ there is no file. Uploads are accepted for `.pdf`, `.png`, `.jpg`, `.jpeg`,
 Full request/response detail for every endpoint, including each error case, is in
 [`docs/api-contract.md`](./docs/api-contract.md).
 
+### Study materials
+
+`POST /api/materials` is a **separate upload path** from `POST /api/ask`, with a
+narrower allowlist — `.pdf` and `.txt` only — and its own size limit. An `/api/ask`
+attachment is inlined into one prompt and forgotten; a material is stored,
+extracted, chunked and kept, so the two deliberately share no middleware and no
+limit.
+
+Upload runs the whole pipeline synchronously and returns once the document is
+`ready` or `failed`:
+
+```
+validate (extension + MIME + magic bytes) → store → extract text
+  → normalize → chunk (1800 chars, 250 overlap) → persist → ready
+```
+
+Nothing in it calls Gemini: extraction is deterministic parsing, not
+interpretation. Uploaded files are written to `STUDYPAL_STORAGE_DIR` under
+generated keys — the original filename is metadata and is never used as a path —
+and no filesystem path appears in any response.
+
+**Embeddings, semantic search and RAG are deferred to SP-V2-004.** The full
+pipeline, the exact normalization rules, the chunking algorithm, the security
+posture and the known limitations are documented in
+[`docs/material-processing.md`](./docs/material-processing.md).
+
 ### Note on identity
 
 A "username" is an unverified string. There is no password, no token and no
 authorization check: anyone who knows or guesses a username can read that
-student's history. This is the pre-existing behaviour, kept deliberately for
-now — see [`docs/security-baseline.md`](./docs/security-baseline.md) (S1).
+student's history, and now also list, read and delete their uploaded materials.
+Material ownership *is* enforced — student A cannot reach student B's material by
+id — but nothing stops someone claiming to **be** student B. This is the
+pre-existing behaviour, kept deliberately for now — see
+[`docs/security-baseline.md`](./docs/security-baseline.md) (S1). Uploaded
+documents make it matter more than it did: this API is not fit for real student
+data until authentication exists.
 
 ## Tests
 
 ```bash
-npm test              # 99 tests
+npm test              # 246 tests in 56 suites
 npm run test:baseline # 35 — the API-contract subset
 npm run characterize  # print observed behaviour across ~30 request variants
 ```
@@ -223,6 +263,28 @@ named `studypal_test_run_%` and cleared by `dropStaleTestDatabases()`.
   asserts both query plans use the documented indexes, and that no table
   reserved for a later V2 ticket has been created early.
 
+- **`tests/materials/schema.test.js`** (34) — the same treatment for
+  `materials` and `material_chunks`: both tables' columns, the foreign keys, every
+  CHECK constraint, `UNIQUE (material_id, chunk_index)`, the exact index list, the
+  list query's plan, and cascade deletion at both levels.
+
+- **`tests/materials/processing.test.js`** (54) — the pipeline as pure
+  functions: upload validation (extension vs. MIME vs. magic bytes), PDF and text
+  extraction, all nine normalization steps, chunk determinism, measured overlap,
+  ordering, and termination on pathological input.
+
+- **`tests/materials/api.test.js`** (36) — the five material endpoints over real
+  HTTP: happy paths for PDF and TXT, every rejection code, ownership isolation
+  between two users, empty-document failure, and deletion removing the chunks
+  **and** the stored file.
+
+- **`tests/materials/architecture.test.js`** (22) — the layering rules as tests
+  rather than a review checklist: SQL only in repositories, the filesystem only
+  behind the storage service, no Gemini import under `src/materials/`, and none of
+  the infrastructure this iteration defers present in `src/` or `package.json`.
+  Each rule carries a counter-assertion that its pattern still matches something,
+  because the way a grep-based check fails is by silently matching nothing.
+
 ## Architecture
 
 ```
@@ -237,6 +299,11 @@ src/
   services/        use cases: session, question, ai, upload
   repositories/    the only modules containing SQL
   ai/              gemini.client.js (the only @google/genai importer) + prompts/
+  materials/       the SP-V2-003 feature, self-contained: routes, controller,
+                   service, repository, processing service, and the deterministic
+                   document modules (extractor, normalizer, chunker, validation)
+  storage/         local-storage.service.js — the only module that touches the
+                   filesystem: save, read, delete, exists, over generated keys
   middleware/      cors, validation, upload, security headers, error handler
   utils/           logger, AppError, version
 scripts/migrate.mjs        CLI for the runner: `up` and `status`
@@ -248,12 +315,22 @@ compose.yaml               local PostgreSQL 16 on 127.0.0.1:5434
 Controllers contain no SQL and no provider calls; services never touch `req` or
 `res`; layers throw and only the HTTP boundary formats a response. `pg` is
 imported by `src/config/database.js`, `src/config/pg-types.js` and the test
-helpers, and by nothing else.
+helpers, and by nothing else. `node:fs` is imported by exactly three modules:
+`src/storage/local-storage.service.js`, which is the storage abstraction itself,
+plus `src/db/migrator.js` (reads the migration files) and `src/utils/version.js`
+(reads `package.json` for `/health`) — both startup-time, neither on a request
+path. Nothing in `src/materials/` touches the filesystem directly.
+`tests/materials/architecture.test.js` asserts all of that by reading the source
+tree, so a layering rule cannot quietly stop being true while the tests stay
+green — and each rule is paired with an assertion that its pattern still matches
+something, so the check cannot go vacuous either.
 
 [`docs/database-architecture.md`](./docs/database-architecture.md) covers the
 schema, the indexes and why each exists, the migration strategy, and connection
-management. [`docs/current-architecture.md`](./docs/current-architecture.md)
-describes both the pre-refactor system and the current one, and
+management. [`docs/material-processing.md`](./docs/material-processing.md) covers
+document ingestion end to end.
+[`docs/current-architecture.md`](./docs/current-architecture.md) describes both
+the pre-refactor system and the current one, and
 [`docs/security-baseline.md`](./docs/security-baseline.md) records what is fixed
 and what is knowingly deferred.
 
@@ -273,6 +350,13 @@ and what is knowingly deferred.
   the server's `max_connections` divided by the number of instances.
 - **Back up the database.** Data now lives in PostgreSQL, so a mounted volume is
   the database server's concern; `pg_dump` on a schedule is yours.
+- **Point `STUDYPAL_STORAGE_DIR` at a persistent volume.** Uploaded materials are
+  on the local filesystem this iteration, so the default (`./data/uploads` inside
+  the deployment) is lost on every redeploy, and a `materials` row whose file is
+  gone reads as `ready` but cannot be re-chunked. This also means **more than one
+  instance needs shared storage** for materials, even though PostgreSQL itself no
+  longer restricts instance count. Object storage is the fix and is deferred —
+  `docs/material-processing.md` §15 has the migration path.
 - **Set `FRONTEND_URL`** so CORS is not wide open.
 - **Rate limiting is not implemented.** `POST /api/ask` bills a Gemini call per
   request with no ceiling and no authentication. Put a limit in front of it
