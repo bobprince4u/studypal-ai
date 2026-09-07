@@ -30,6 +30,16 @@ export class AppError extends Error {
 export const badRequest = (message, options) =>
   new AppError(400, message, options);
 
+/**
+ * 404 — no such resource, as far as this caller is concerned.
+ *
+ * Note the "as far as this caller is concerned". The material endpoints use this
+ * for a resource that exists but belongs to someone else, deliberately, rather
+ * than a 403: a 403 confirms the id is real, which is information an
+ * unauthenticated caller should not be able to enumerate.
+ */
+export const notFound = (message, options) => new AppError(404, message, options);
+
 /** 413 — the request or an upload exceeded a configured limit. */
 export const payloadTooLarge = (message, options) =>
   new AppError(413, message, options);

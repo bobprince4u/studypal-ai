@@ -440,19 +440,28 @@ describe("scope", () => {
     const { rows } = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
     );
+    // material_chunks and materials joined this list in SP-V2-003, which is the
+    // only reason they are here: the assertion is still exact, so the next
+    // ticket that adds a table has to come back and say so.
     assert.deepEqual(
       rows.map((r) => r.tablename),
-      ["questions", "schema_migrations", "users"],
-      "SP-V2-002 is the data foundation only — no V2 feature tables yet",
+      [
+        "material_chunks",
+        "materials",
+        "questions",
+        "schema_migrations",
+        "users",
+      ],
+      "the data foundation plus SP-V2-003's materials — no other feature tables yet",
     );
   });
 
   it("has not created the tables reserved for later tickets", async () => {
-    // Named explicitly so a premature `CREATE TABLE materials` fails here rather
-    // than shipping an empty table nothing reads.
+    // Named explicitly so a premature `CREATE TABLE exams` fails here rather
+    // than shipping an empty table nothing reads. `materials` and
+    // `material_chunks` were on this list until SP-V2-003 created them, and are
+    // now asserted above instead.
     const reserved = [
-      "materials",
-      "material_chunks",
       "study_plans",
       "study_plan_tasks",
       "exams",

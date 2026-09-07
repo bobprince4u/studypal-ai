@@ -19,6 +19,13 @@ out/
 # ── Uploads ────────────────────────────
 uploads/
 
+# Uploaded study materials (SP-V2-003). The default STUDYPAL_STORAGE_DIR is
+# `studypal-backend/data/uploads`; `data/` is ignored wholesale so a deployment
+# pointing the variable elsewhere under it is covered too. These are real student
+# documents — §26 forbids committing them, and this pattern is what makes that
+# structural rather than a matter of care with `git add`.
+data/
+
 # ── OS ─────────────────────────────────
 .DS_Store
 Thumbs.db

@@ -23,6 +23,8 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -81,6 +83,35 @@ export async function startServer(opts = {}) {
     database = await createIsolatedDatabase({ label: opts.label ?? "srv" });
   }
 
+  // A private upload directory per server, in the OS temp dir — §25's "tests
+  // should use an isolated temporary storage directory". Two properties matter:
+  // it is OUTSIDE the repository, so a test can never write into a developer's
+  // real `data/uploads` or leave files for `git add` to pick up; and it is unique
+  // per server, so one suite's uploads are invisible to another's list endpoint.
+  // Created here rather than left to the app so `stop()` can remove it whether or
+  // not the server ever wrote anything.
+  const storageDir =
+    opts.env?.STUDYPAL_STORAGE_DIR ??
+    (await fs.mkdtemp(path.join(os.tmpdir(), "studypal-test-uploads-")));
+  // A directory this harness did not create is not this harness's to delete.
+  const ownsStorageDir = opts.env?.STUDYPAL_STORAGE_DIR === undefined;
+
+  /**
+   * Give back everything this harness allocated: the private database and the
+   * temporary upload directory.
+   *
+   * Best-effort and idempotent, because it runs on three paths — the two
+   * early-exit branches of the startup loop and `stop()` — and on the first two
+   * something has already gone wrong. A throw here would replace the real
+   * "server exited early" diagnosis with a cleanup error.
+   */
+  async function releaseResources() {
+    await database?.drop().catch(() => {});
+    if (ownsStorageDir) {
+      await fs.rm(storageDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
   const child = spawn(
     process.execPath,
     ["--import", PRELOAD, entryPath],
@@ -93,6 +124,7 @@ export async function startServer(opts = {}) {
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || "fake-key-for-tests",
         NODE_ENV: "test",
         ...(database ? { STUDYPAL_TEST_DATABASE_URL: database.url } : {}),
+        STUDYPAL_STORAGE_DIR: storageDir,
         ...opts.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -112,7 +144,7 @@ export async function startServer(opts = {}) {
     if (child.exitCode !== null) {
       // Drop the private database before throwing, or a failing start leaks one
       // per attempt and the server eventually runs out of databases.
-      await database?.drop().catch(() => {});
+      await releaseResources();
       throw new Error(
         `server exited early (code ${child.exitCode})\n` +
           `--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
@@ -123,7 +155,7 @@ export async function startServer(opts = {}) {
       break; // any HTTP response (incl. 404) means it is listening
     } catch {
       if (Date.now() > deadline) {
-        await database?.drop().catch(() => {});
+        await releaseResources();
         throw new Error(
           `server did not start within 20s\n` +
             `--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
@@ -172,6 +204,29 @@ export async function startServer(opts = {}) {
     /** Connection string of this server's private database, if it has one. */
     databaseUrl: database?.url ?? null,
     databaseName: database?.name ?? null,
+    /**
+     * This server's upload directory.
+     *
+     * Exposed so a cleanup test can assert on the bytes themselves rather than
+     * only on what the API says about them: that an upload landed on disk, and
+     * that DELETE removed it. Nothing else can answer that question — the API
+     * deliberately never returns a storage key or a path (§18).
+     */
+    storageDir,
+    /**
+     * Names of the files currently stored, sorted.
+     *
+     * Returns [] when the directory does not exist, which is the state before
+     * the first upload: the app creates it lazily.
+     */
+    async storedFiles() {
+      try {
+        return (await fs.readdir(storageDir)).sort();
+      } catch (err) {
+        if (err.code === "ENOENT") return [];
+        throw err;
+      }
+    },
     get stdout() {
       return stdout;
     },
@@ -186,7 +241,7 @@ export async function startServer(opts = {}) {
       // Dropped after the process is gone: PostgreSQL will not drop a database
       // that still has a connected client, and SIGKILL leaves the backends to be
       // reaped, hence WITH (FORCE) inside drop().
-      await database?.drop().catch(() => {});
+      await releaseResources();
     },
   };
 }

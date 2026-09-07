@@ -51,7 +51,20 @@ removed from `package.json`, and the old schema is kept unexecuted at
 
 ## 2. Schema overview
 
-Two application tables plus the migration runner's bookkeeping.
+Four application tables plus the migration runner's bookkeeping. `users` and
+`questions` came from SP-V2-002; `materials` and `material_chunks` were added by
+SP-V2-003.
+
+```
+users
+  ├── questions               one row per question asked      (SP-V2-002)
+  └── materials               one row per uploaded document   (SP-V2-003)
+        └── material_chunks   one row per text chunk, ordered (SP-V2-003)
+```
+
+Everything hangs off `users.id`, and **every foreign key is `ON DELETE
+CASCADE`** — deleting a user removes their questions, their materials and those
+materials' chunks, in one statement.
 
 ```
 ┌─────────────────────────────────────┐
@@ -79,6 +92,34 @@ Two application tables plus the migration runner's bookkeeping.
 │ created_at TIMESTAMPTZ NOT NULL     │
 └─────────────────────────────────────┘
 
+┌─────────────────────────────────────────────┐
+│ materials                                   │
+├─────────────────────────────────────────────┤
+│ id                BIGINT       PK identity  │
+│ user_id           BIGINT       NOT NULL  FK │ → users (id), CASCADE
+│ original_filename TEXT         NOT NULL     │ metadata only, never a path
+│ storage_key       TEXT         NOT NULL   ∪ │ generated, opaque
+│ mime_type         TEXT         NOT NULL     │ determined from content
+│ file_size         BIGINT       NOT NULL     │
+│ status            TEXT         NOT NULL     │ = 'uploaded'
+│ page_count        INTEGER      NULL         │ NULL for .txt
+│ error_message     TEXT         NULL         │ set iff status = 'failed'
+│ created_at        TIMESTAMPTZ  NOT NULL     │
+│ updated_at        TIMESTAMPTZ  NOT NULL     │
+└─────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────┐
+│ material_chunks                             │
+├─────────────────────────────────────────────┤
+│ id           BIGINT       PK identity       │
+│ material_id  BIGINT       NOT NULL       FK │ → materials (id), CASCADE
+│ chunk_index  INTEGER      NOT NULL        ∪ │ ∪ = (material_id, chunk_index)
+│ content      TEXT         NOT NULL          │
+│ page_number  INTEGER      NULL              │ NULL when unknown
+│ char_count   INTEGER      NOT NULL          │ = char_length(content)
+│ created_at   TIMESTAMPTZ  NOT NULL          │
+└─────────────────────────────────────────────┘
+
 ┌─────────────────────────────────────┐
 │ schema_migrations   (bookkeeping)   │
 ├─────────────────────────────────────┤
@@ -91,13 +132,25 @@ Two application tables plus the migration runner's bookkeeping.
 ∪ = UNIQUE
 ```
 
-**Relationship:** one user has many questions. That is the only relationship in
-the schema. `ON DELETE CASCADE` means deleting a user deletes their questions —
-chosen so the first data-deletion request is a `DELETE` rather than a migration.
+**Relationships:** one user has many questions and many materials; one material
+has many chunks. `ON DELETE CASCADE` throughout means deleting a user deletes
+their questions, materials and chunks — chosen so the first data-deletion request
+is a `DELETE` rather than a migration. The one thing the cascade cannot reach is
+the filesystem: deleting a user through SQL orphans their uploaded bytes on disk.
+Nothing does that today, and it is recorded as a limitation in §9 rather than
+worked around with a trigger.
+
+**Embeddings and pgvector are intentionally deferred to SP-V2-004.**
+`material_chunks` deliberately has no vector column. The next iteration adds one
+with `ALTER TABLE … ADD COLUMN embedding vector(n)` — a nullable add that
+rewrites no rows — plus an index; nothing here has to be restructured for it. See
+[`material-processing.md`](./material-processing.md) §15.
 
 The full DDL, with a comment on every non-obvious decision, is
-[`migrations/postgres/001_core_schema.sql`](../migrations/postgres/001_core_schema.sql).
-That file is the source of truth; this section describes it.
+[`migrations/postgres/001_core_schema.sql`](../migrations/postgres/001_core_schema.sql)
+and
+[`migrations/postgres/002_materials.sql`](../migrations/postgres/002_materials.sql).
+Those files are the source of truth; this section describes them.
 
 ### `users` replaces `sessions`
 
@@ -135,6 +188,40 @@ text where it expected an object. The `questions_answer_is_object` CHECK makes
 that mistake a write error instead of a subtly wrong response weeks later, and
 `tests/schema.test.js` asserts all five wrong shapes are rejected.
 
+### `materials` and `material_chunks`
+
+Added by SP-V2-003 for uploaded study documents. The pipeline that writes them —
+validation, storage, extraction, normalization, chunking — is documented in
+[`material-processing.md`](./material-processing.md); what follows is only the
+part that is a schema decision.
+
+- **`storage_key`, not a path.** Uploaded filenames are attacker-controlled, so
+  the key is generated (a hyphen-stripped UUID plus the validated extension) and
+  the original filename is stored as metadata that nothing resolves. The
+  `materials_storage_key_safe` CHECK enforces the same character rule the storage
+  service enforces in code — one stops a bad key being *stored*, the other stops
+  one being *used*, and they fail at different times.
+- **`status` is a CHECK constraint, not a PostgreSQL enum**, following the
+  convention 001 set for `topic`. Adding a state to a CHECK is one migration that
+  rewrites no rows, whereas `ALTER TYPE … ADD VALUE` cannot run inside a
+  transaction block on older servers and cannot remove a value at all.
+- **`error_message` is tied to `status` by a constraint.**
+  `materials_error_message_matches_status` requires it exactly when `status =
+  'failed'` and forbids it otherwise, so a failure cannot reach a client with
+  nothing to show and a success cannot carry a stale error.
+- **`char_count` is denormalised** and checked against `char_length(content)`, so
+  a mismatch between the chunker's arithmetic and what was written is a write
+  error rather than silent drift.
+- **`page_number` is nullable on purpose.** `.txt` has no pages, and a PDF page
+  whose text the parser cannot attribute gets `NULL` rather than an invented
+  number — a wrong citation is worse than an absent one.
+- **`UNIQUE (material_id, chunk_index)`** because ordering is part of the data: a
+  duplicate index is a corrupt document, not a tolerable retry artefact.
+
+`tests/materials/schema.test.js` asserts each of these through SQL — what is
+tested is that the *database* refuses the bad row, not that the application
+avoids writing it.
+
 `topic` is denormalised out of `answer` on purpose: `GET /api/progress` groups by
 it, and a plain indexed column beats a JSONB expression for the one field that is
 queried rather than merely displayed.
@@ -162,7 +249,7 @@ shapes.
 
 ## 3. Indexes
 
-Three indexes exist beyond what the PK and UNIQUE constraints create, and each
+Four indexes exist beyond what the PK and UNIQUE constraints create, and each
 one serves a query in the code today. No speculative indexes: every index costs
 write throughput and disk, and an unused one is pure loss.
 
@@ -170,14 +257,23 @@ write throughput and disk, and an unused one is pure loss.
 | --- | --- | --- |
 | `idx_questions_user_created (user_id, created_at DESC)` | `GET /api/history/:username` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 30` | Equality column first, then the sort column. PostgreSQL finds the user's rows and walks them already in order, so the `LIMIT` stops after 30 with no sort step. This is the index SP-V2-001 deferred (A9). |
 | `idx_questions_user_topic (user_id, topic)` | `GET /api/progress/:username` — `WHERE user_id = $1 GROUP BY topic ORDER BY count DESC LIMIT 6` | Including `topic` lets the grouping read the index rather than fetching every matching row. A second index on the same leading column is only worth it because progress is called on every page load alongside history. |
+| `idx_materials_user_created (user_id, created_at DESC)` | `GET /api/materials?username=…` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2` | Same shape and same reasoning as the history index, and the only material query no PK or UNIQUE constraint already covers. This is §29's "index material ownership". |
 | `users_username_key` (from the UNIQUE constraint) | Every endpoint — each resolves a username to a `user_id` first | Also the constraint `POST /api/session` relies on via `ON CONFLICT (username)`. |
 
-`tests/schema.test.js` asserts the exact index list on `questions`, so adding one
-fails a test and prompts a justification. It also runs `EXPLAIN` against both
-queries at a few thousand rows and asserts the planner actually uses these
-indexes — an index PostgreSQL declines to use is the same as no index, and at
-fixture scale a sequential scan genuinely is cheaper, so the test builds enough
-rows to reach the regime the index exists for.
+`material_chunks` gets **no added index**. Its `UNIQUE (material_id,
+chunk_index)` constraint already provides the index for both queries against it —
+the ordered read (`WHERE material_id = $1 ORDER BY chunk_index`) and the
+chunk-count aggregate — so §29's "index chunk ordering" is satisfied by a
+constraint that had to exist anyway. Adding a second index on `material_id` alone
+would duplicate that one's leading column for no gain.
+
+`tests/schema.test.js` asserts the exact index list on `questions`, and
+`tests/materials/schema.test.js` does the same for both material tables, so
+adding one fails a test and prompts a justification. Both suites also run
+`EXPLAIN` against the queries these indexes exist for, at a few thousand rows,
+and assert the planner actually uses them — an index PostgreSQL declines to use is
+the same as no index, and at fixture scale a sequential scan genuinely is cheaper,
+so the tests build enough rows to reach the regime the index exists for.
 
 ---
 
@@ -391,22 +487,29 @@ No SQLite file is tracked by git, and none ever was.
 
 ## 8. Where V2 features attach
 
-These tables are **not created yet**. A table with no code reading it is a guess
-about a future requirement rather than a schema, and `tests/schema.test.js`
-asserts by name that none of them exist, so creating one early fails a test.
+These do **not exist yet**. A table with no code reading it is a guess about a
+future requirement rather than a schema, and `tests/schema.test.js` asserts by
+name that none of the reserved tables exist, so creating one early fails a test.
 
 | Feature | Expected shape | Attaches to |
 | --- | --- | --- |
-| Uploaded study materials | `materials` (one row per file), `material_chunks` (text + embedding) | `materials.user_id → users.id` |
-| Semantic search over materials | `pgvector` extension, an HNSW index on `material_chunks.embedding` | Requires the extension; deliberately not installed |
+| Semantic search over materials | `material_chunks.embedding` (a new nullable column), the `pgvector` extension, an HNSW index on it | The table `materials`/`material_chunks` already provide; **SP-V2-004** |
 | Study plans | `study_plans`, `study_plan_tasks` | `study_plans.user_id → users.id` |
 | Exams and attempts | `exams`, `exam_questions`, `exam_attempts`, `attempt_answers` | `exams.user_id → users.id` |
 | Learning analytics | `learning_events` | `learning_events.user_id → users.id` |
 | Real accounts | `password_hash`, `email_verified_at` on `users`; a `sessions` table that actually holds sessions | The nullable columns already on `users` |
 
+Uploaded study materials **have now been built** — SP-V2-003 created `materials`
+and `material_chunks`, so they have moved out of this table and into §2. What that
+ticket deliberately did *not* create is the embedding column, and
+**embeddings and pgvector are intentionally deferred to SP-V2-004**:
+`tests/materials/architecture.test.js` asserts by grep that no vector column,
+`pgvector` dependency or embedding call exists yet, so starting early fails a
+test the same way an early table would.
+
 Everything hangs off `users.id`, which is the reason SP-V2-002 introduced a
 surrogate key rather than keying `questions` on `username`. Each of these is a
-new numbered file in `migrations/postgres/`; the existing one is immutable.
+new numbered file in `migrations/postgres/`; the existing ones are immutable.
 
 ---
 
@@ -421,3 +524,7 @@ new numbered file in `migrations/postgres/`; the existing one is immutable.
 | 5 | No connection retry or backoff | A blip surfaces as a 500 for the request that hit it. The pool recovers on the next request; nothing retries on the caller's behalf. |
 | 6 | No read replicas, no partitioning, no archival | `questions` grows without bound. Fine at current scale; a retention policy is a later decision. |
 | 7 | Data at rest is unencrypted | Same posture as the SQLite file. A deployment holding real student data needs disk encryption and a backup policy. |
+| 8 | **The cascade stops at the database.** Deleting a user removes their materials and chunks but not the uploaded files those rows pointed at | Orphaned bytes in the storage directory. Nothing triggers it today — there is no user-deletion endpoint, and `DELETE /api/materials/:id` removes the file explicitly — so it is recorded rather than solved with a trigger that would have to reach outside PostgreSQL. |
+| 9 | `materials.updated_at` is maintained by the repository, not by a trigger | Every status transition sets it in its `UPDATE`. A future writer that forgets to would leave it stale, the same exposure as limitation 4. |
+| 10 | `material_chunks.content` is stored inline, so PostgreSQL TOASTs and compresses it | Fine at a 10 MB upload cap: a chunk is ~1800 characters and a large document is a few thousand rows. A corpus large enough to care would want the text out of the row, which is a decision for whichever iteration hits it. |
+| 11 | No deduplication of identical uploads | The same document uploaded twice is two `materials` rows, two storage keys and two chunk sets. Content addressing would fix it and is a later decision. |
