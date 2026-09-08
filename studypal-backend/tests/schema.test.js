@@ -478,14 +478,21 @@ describe("scope", () => {
     assert.deepEqual(rows, []);
   });
 
-  it("has no SQLite remnant and no extension beyond the default", async () => {
+  it("has no SQLite remnant and no extension beyond the two it uses", async () => {
     const { rows } = await pool.query(
       "SELECT extname FROM pg_extension ORDER BY extname",
     );
+    // `vector` joined `plpgsql` in SP-V2-004: migration 003 runs
+    // CREATE EXTENSION IF NOT EXISTS vector because material_chunks.embedding is
+    // a vector(1536) and the type does not exist without it. This list stays
+    // exact for the same reason it was exact when it held one name — an extension
+    // is a deployment requirement, and every one added here is one more thing a
+    // managed provider has to offer before StudyPal can run on it. The next
+    // ticket that needs one has to come back and justify it.
     assert.deepEqual(
       rows.map((r) => r.extname),
-      ["plpgsql"],
-      "no pgvector yet — that belongs to a later ticket",
+      ["plpgsql", "vector"],
+      "plpgsql plus pgvector — no other extension is a deployment requirement",
     );
   });
 });
