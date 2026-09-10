@@ -1,14 +1,14 @@
 /**
- * §27's architecture checks, as tests rather than as a checklist someone runs by
- * hand.
+ * The architecture checks, as tests rather than as a checklist someone runs by
+ * hand. SP-V2-003 §27 and SP-V2-004 §46.
  *
  * Every assertion here reads the source tree and asserts a property of its SHAPE:
- * which layer may contain SQL, which module may touch the filesystem, what the
- * material pipeline may import. None of it exercises behaviour — the other suites
- * do that — and that is the point. A layering rule that lives only in a review
- * comment is one refactor away from being gone, and the failure it permits (a
- * query in a controller, an `fs` call in a service) is invisible in a green test
- * run because the feature still works.
+ * which layer may contain SQL, which module may touch the filesystem, which may
+ * call a model, where ownership is enforced. None of it exercises behaviour — the
+ * other suites do that — and that is the point. A layering rule that lives only in
+ * a review comment is one refactor away from being gone, and the failure it permits
+ * (a query in a controller, an `fs` call in a service, a model call on a path with
+ * no evidence) is invisible in a green test run because the feature still works.
  *
  * The checks are deliberately textual and deliberately blunt. A real import graph
  * would be more precise and would need a parser; grepping for `node:fs` catches
@@ -32,6 +32,14 @@
  * three files may touch the filesystem, each with its reason recorded next to it.
  * Naming them means adding a fourth requires editing this file, which is exactly
  * the review the rule is for.
+ *
+ * A RULE THAT CHANGED BETWEEN ITERATIONS
+ * -------------------------------------
+ * SP-V2-003 asserted that nothing under src/materials imported an AI client and
+ * that the word "embedding" appeared nowhere in src/. SP-V2-004 delivers embeddings
+ * and material chat, so both had to change. Neither was deleted: each is replaced
+ * by a narrower rule that is harder to satisfy by accident, and the reasoning is
+ * recorded at the describe block that replaced it rather than in a commit message.
  *
  *   node --test tests/materials/architecture.test.js
  */
@@ -323,61 +331,355 @@ describe("§27 filesystem access stays in the storage layer", () => {
   });
 });
 
-describe("§27 the material pipeline has no AI dependency", () => {
-  it("nothing under src/materials or src/storage imports a Gemini client", async () => {
-    const files = [...(await jsFiles(path.join(SRC, "materials"))), ...(await jsFiles(path.join(SRC, "storage")))];
-    assert.ok(files.length >= 8, "the check must actually find the pipeline");
+describe("§31, §46 the AI dependency enters through exactly one door", () => {
+  /**
+   * SP-V2-003 asserted that NOTHING under src/materials touched an AI client. That
+   * rule is gone, because SP-V2-004 deliberately breaks it: retrieval embeds a
+   * query and chat calls a model, both from src/materials.
+   *
+   * It is replaced by two narrower rules that are harder to satisfy accidentally,
+   * so this is a tightening rather than a relaxation:
+   *
+   *   • the DETERMINISTIC modules below stay AI-free — the property that made
+   *     SP-V2-003's pipeline testable offline is preserved exactly where it
+   *     mattered, rather than being traded away for the whole directory;
+   *   • the provider SDK is imported in exactly ONE file in the entire tree, so
+   *     every AI call in the feature goes through src/ai/ (§31).
+   *
+   * Nothing that used to be checked has become unchecked: extraction, chunking,
+   * normalisation, validation, storage, context building and source mapping are all
+   * still forbidden from reaching a provider, and the SDK rule now covers files
+   * SP-V2-003's version never looked at.
+   */
+  const DETERMINISTIC = [
+    "src/materials/document-extractor.js",
+    "src/materials/text-normalizer.js",
+    "src/materials/text-chunker.js",
+    "src/materials/file-validation.js",
+    "src/materials/material-processing.service.js",
+    "src/materials/material-upload.middleware.js",
+    // Both of these handle retrieved text on the way to a prompt and neither may
+    // call anything: a builder that could reach a provider is a builder that could
+    // be tested only with one.
+    "src/materials/context-builder.js",
+    "src/materials/source-mapper.js",
+    "src/storage/local-storage.service.js",
+  ];
+
+  // Comments stay OUT and strings stay IN, for the reason `assertNoFilesystem`
+  // documents: an import specifier is a string literal, so stripping strings would
+  // reduce `import … from "../ai/embedding.service.js"` to `import … from ""` and
+  // make every rule below vacuous.
+  const AI_DEPENDENCY =
+    /@google\/genai|GoogleGenAI|\/ai\/|\bembedContent|\bembedQuery|\bembedDocuments|\bgenerateJsonContent|GEMINI_API_KEY/;
+  const PROVIDER_SDK = /@google\/genai|GoogleGenAI/;
+
+  it("keeps the deterministic document modules free of any AI dependency", async () => {
+    const present = await jsFiles(SRC);
+    for (const file of DETERMINISTIC) {
+      assert.ok(present.includes(file), `${file} was renamed or removed — fix DETERMINISTIC`);
+    }
     assertNoneMatch(
-      await readAll(files),
-      /@google\/genai|GoogleGenAI|generateContent|GEMINI_API_KEY/,
-      "§12: no Gemini dependency anywhere in this processing pipeline. Processing is deterministic (§13).",
+      await readAll(DETERMINISTIC),
+      AI_DEPENDENCY,
+      "§13, §46: extraction, chunking, storage, context building and source mapping " +
+        "must run with no provider, no credential and no network.",
+      stripComments,
     );
   });
 
-  it("the AI client is still reachable from the question path, so the check is not vacuous", async () => {
-    // The rule above forbids an import. If nothing in the codebase imported the
-    // SDK at all — because it had been removed, or renamed — the rule would pass
-    // while meaning nothing. This anchors it.
-    const files = await jsFiles(SRC);
-    const importers = Object.entries(await readAll(files))
-      .filter(([, source]) => /@google\/genai/.test(source))
+  it("still matches the modules that legitimately do use AI, so the rule is not vacuous", async () => {
+    // The anchor. A pattern that stopped matching anything would leave the rule
+    // above permanently green on a codebase that had moved the SDK into the
+    // chunker. Each of these SHOULD match, and does so through a different
+    // spelling — an import path, a client function, a service function.
+    for (const file of [
+      "src/ai/gemini.client.js",
+      "src/ai/embedding.service.js",
+      "src/materials/material-indexing.service.js",
+      "src/materials/retrieval.service.js",
+      "src/materials/material-chat.service.js",
+    ]) {
+      const source = await fs.readFile(path.join(BACKEND_ROOT, file), "utf8");
+      assert.match(
+        stripComments(source),
+        AI_DEPENDENCY,
+        `${file} should depend on the AI layer — AI_DEPENDENCY no longer matches it`,
+      );
+    }
+  });
+
+  it("imports the provider SDK in exactly one file", async () => {
+    // §31: "do not instantiate GoogleGenAI directly in controllers, repositories,
+    // retrieval modules", "do not create duplicate Gemini clients". Both are the
+    // same statement — there is one client, and this is it.
+    //
+    // An equality against a NON-EMPTY list, which is what makes this check
+    // self-anchoring: it fails if a second file imports the SDK, and it also fails
+    // if the one legitimate importer stops doing so.
+    const importers = Object.entries(await readAll(await jsFiles(SRC)))
+      .filter(([, source]) => PROVIDER_SDK.test(stripComments(source)))
       .map(([file]) => file);
-    assert.ok(importers.length > 0, "the Gemini SDK should still be used by /api/ask");
-    assert.equal(
-      importers.some((file) => file.startsWith("src/materials/")),
-      false,
+    assert.deepEqual(importers, ["src/ai/gemini.client.js"]);
+  });
+
+  it("keeps the provider SDK out of every repository and controller", async () => {
+    // §27, §46, stated over the layers rather than over one directory: a repository
+    // that could embed text, or a controller that could generate, has bypassed the
+    // service that owns the decision of whether to spend a provider call at all.
+    const files = (await jsFiles(SRC)).filter(
+      (file) => /\.repository\.|\.controller\./.test(file),
+    );
+    assert.ok(files.length >= 6, "the check must actually find repositories and controllers");
+    assertNoneMatch(
+      await readAll(files),
+      AI_DEPENDENCY,
+      "§46: repositories speak SQL and controllers speak HTTP. Neither calls a model.",
+      stripComments,
+    );
+  });
+
+  it("keeps vector arithmetic out of controllers and services", async () => {
+    // §11 and §46: the DATABASE computes similarity. A cosine implemented in a
+    // controller means chunks were loaded into Node to be scored there, which is
+    // the exact design §11 forbids — and it would also silently ignore the
+    // threshold and the LIMIT that make the result set bounded.
+    const files = (await jsFiles(SRC)).filter(
+      (file) => /\.controller\.|\.service\./.test(file),
+    );
+    assert.ok(files.length >= 8);
+    assertNoneMatch(
+      await readAll(files),
+      /<=>|\bcosine|dotProduct|Math\.sqrt|Math\.hypot/i,
+      "§11, §46: similarity is computed in SQL, and vector maths lives in src/utils/vector.js.",
+      stripComments,
+    );
+  });
+
+  it("computes vectors where it is supposed to, so that rule is not vacuous", async () => {
+    // The complement: the arithmetic has to exist somewhere, and the two places it
+    // is allowed are the normalisation helper and the retrieval SQL.
+    assert.match(
+      await fs.readFile(path.join(SRC, "utils", "vector.js"), "utf8"),
+      /Math\.sqrt/,
+    );
+    assert.match(
+      await fs.readFile(path.join(SRC, "materials", "retrieval.repository.js"), "utf8"),
+      /<=>/,
     );
   });
 });
 
-describe("§27 no deferred infrastructure crept in", () => {
+describe("§15, §16, §46 retrieval cannot cross a user boundary", () => {
+  const RETRIEVAL_REPOSITORY = path.join(SRC, "materials", "retrieval.repository.js");
+
+  it("puts the ownership predicate in the SQL", async () => {
+    // §15: "the ownership constraint should be part of the SQL query". Not a
+    // parameter a caller remembers to pass through, not a check a service performs
+    // first — a WHERE clause, so there is no code path that reaches a chunk row
+    // belonging to another user, including one a future refactor adds.
+    const sql = stripComments(await fs.readFile(RETRIEVAL_REPOSITORY, "utf8"));
+    assert.match(sql, /WHERE\s+m\.user_id\s*=\s*\$1/);
+
+    // One SELECT in the file, so there is no second, unscoped query hiding behind
+    // the scoped one. A vector search that forgot the join condition would be
+    // undetectable in its results — it would simply return other people's
+    // documents, correctly ordered.
+    assert.equal((sql.match(/\bSELECT\b/gi) ?? []).length, 1);
+  });
+
+  it("has no retrieval function that can be called without a user", async () => {
+    const sql = stripComments(await fs.readFile(RETRIEVAL_REPOSITORY, "utf8"));
+    assert.deepEqual(sql.match(/export\s+(?:async\s+)?function\s+(\w+)/g), [
+      "export async function searchSimilarChunks",
+    ]);
+    // §16's "do not trust client-provided user IDs" needs somewhere for the
+    // trusted one to enter: the parameter is destructured, so a call omitting it
+    // passes `undefined` to a bigint parameter and the query errors rather than
+    // matching every row.
+    assert.match(sql, /searchSimilarChunks\(\{\s*userId,/);
+
+    // And every call site in the tree supplies it.
+    const callers = Object.entries(await readAll(await jsFiles(SRC))).flatMap(
+      ([file, source]) =>
+        [...stripComments(source).matchAll(/searchSimilarChunks\(([\s\S]{0,120})/g)].map(
+          (match) => [file, match[1]],
+        ),
+    );
+    // Two: the definition and the one caller. Fewer means the pattern broke.
+    assert.ok(callers.length >= 2, "the check must actually find the call sites");
+    for (const [file, args] of callers) {
+      assert.match(args, /userId/, `${file} calls searchSimilarChunks without a user id`);
+    }
+  });
+
+  it("names the user_id column only inside the repository layer", async () => {
+    /**
+     * §15's "do not retrieve globally then filter in JavaScript", expressed as the
+     * strongest form the codebase can actually hold: nothing above the repository
+     * layer so much as MENTIONS the column. A service that never sees `user_id`
+     * cannot filter on it after the fact, cannot forget to, and cannot be given a
+     * client-supplied value for it.
+     *
+     * Ownership still reaches the repository, as the resolved camelCase `userId`
+     * argument — which is why this rule can be this absolute without making the
+     * feature impossible to write.
+     */
+    const files = await jsFiles(path.join(SRC, "materials"));
+    const mentions = Object.entries(await readAll(files))
+      .filter(([, source]) => /user_id/.test(stripComments(source)))
+      .map(([file]) => file)
+      .sort();
+    assert.deepEqual(mentions, [
+      "src/materials/material.repository.js",
+      "src/materials/retrieval.repository.js",
+    ]);
+  });
+
+  it("reads no file and holds no connection outside the repository", async () => {
+    // §46 names both for the retrieval path specifically. The filesystem rule is
+    // already asserted tree-wide above; this states it where the spec states it,
+    // and adds the connection rule that the SP-V2-003 check applies to materials.
+    const files = ["src/materials/retrieval.service.js", "src/materials/context-builder.js"];
+    assertNoFilesystem(await readAll(files), "§46: retrieval does not touch the filesystem.");
+    assertNoneMatch(
+      await readAll(files),
+      /config\/database\.js/,
+      "§46: only the repository opens a database connection.",
+      stripComments,
+    );
+  });
+});
+
+describe("§21, §24, §41 the grounding guarantees are structural", () => {
+  const CHAT_SERVICE = path.join(SRC, "materials", "material-chat.service.js");
+
+  it("cannot reach the model on the no-evidence path", async () => {
+    /**
+     * §21 and §46's "no Gemini call when there is no relevant evidence", checked as
+     * an ORDERING in the source rather than only as behaviour.
+     *
+     * tests/materials/chat.test.js asserts the same property the honest way, by
+     * counting provider requests. This is the cheap structural companion: the guard
+     * must come before the only generation call in the file, and must return. A
+     * refactor that moved the call above the guard would still pass every behavioural
+     * test that happens to retrieve something, and would quietly start answering
+     * unfounded questions from the model's general knowledge.
+     *
+     * `generateJsonContent(` with the paren matches the CALL, not the import — the
+     * import spells it `generateJsonContent }`.
+     */
+    const source = stripComments(await fs.readFile(CHAT_SERVICE, "utf8"));
+
+    const guard = source.indexOf("chunks.length === 0");
+    const call = source.indexOf("generateJsonContent(");
+    assert.ok(guard > 0, "the no-evidence guard is gone or was renamed");
+    assert.ok(call > 0, "the generation call is gone or was renamed");
+    assert.ok(guard < call, "§21: the empty-retrieval guard must precede the model call");
+
+    // Precede it AND return from it. A guard that only logged would satisfy an
+    // ordering check while changing nothing. Any `return` in this span is the
+    // guard's — nothing else between the guard and the call returns — and what it
+    // returns is asserted behaviourally in tests/materials/chat.test.js. Matching
+    // the statement rather than an object literal keeps the check about the
+    // control flow, which is the part that must not change.
+    assert.match(source.slice(guard, call), /\breturn\b/);
+
+    // One generation call, so the guard cannot be bypassed by a second path.
+    assert.equal((source.match(/generateJsonContent\(/g) ?? []).length, 1);
+  });
+
+  it("gives the model no field through which to name a source", async () => {
+    // §23, §24: the backend owns source identity. The response schema is where that
+    // is enforced, and it is enforced by ABSENCE — there is no `filename`,
+    // `pageNumber` or `materialId` key for a model to fill in, so there is nothing
+    // to validate, sanitise, or accidentally trust.
+    const { MATERIAL_CHAT_RESPONSE_SCHEMA } = await import(
+      "../../src/ai/prompts/material-chat.prompt.js"
+    );
+    assert.deepEqual(Object.keys(MATERIAL_CHAT_RESPONSE_SCHEMA.properties).sort(), [
+      "answer",
+      "sourceIndexes",
+    ]);
+    assert.equal(MATERIAL_CHAT_RESPONSE_SCHEMA.properties.sourceIndexes.items.type, "integer");
+  });
+
+  it("does not hold a transaction across a provider call", async () => {
+    /**
+     * §41. The indexing service is the only module that both writes vectors and
+     * calls a provider, so it is the only place this can go wrong, and the shape
+     * that keeps it right is visible in the source: the embed call sits between two
+     * repository calls, not inside one.
+     *
+     * Checked as an ordering because the alternative — a transaction wrapping the
+     * provider call — would work perfectly in every test and only show up in
+     * production as pool exhaustion under load.
+     */
+    const source = stripComments(
+      await fs.readFile(path.join(SRC, "materials", "material-indexing.service.js"), "utf8"),
+    );
+    const embed = source.indexOf("embedDocuments(");
+    const persist = source.indexOf("saveEmbeddingsAndMarkIndexed(");
+    assert.ok(embed > 0 && persist > 0);
+    assert.ok(embed < persist, "embed first, then persist in one short transaction");
+
+    // The service itself must not open a transaction at all — withTransaction lives
+    // in the repository, around the write only.
+    assert.doesNotMatch(source, /withTransaction/);
+    assert.match(
+      stripComments(
+        await fs.readFile(path.join(SRC, "materials", "embedding.repository.js"), "utf8"),
+      ),
+      /withTransaction/,
+    );
+  });
+});
+
+describe("§45, §46 no deferred infrastructure crept in", () => {
   /**
-   * Everything §2 and §30 exclude, checked against BOTH the source and the
+   * Everything §2 and §45 exclude, checked against BOTH the source and the
    * dependency list.
    *
    * The source check catches a hand-rolled version; the dependency check catches
-   * an installed one. Either alone would miss the other, and §30's point is that
-   * neither belongs in SP-V2-003.
+   * an installed one. Either alone would miss the other.
+   *
+   * WHAT LEFT THIS LIST, AND WHY THAT IS NOT A WEAKENING
+   * ----------------------------------------------------
+   * SP-V2-003 forbade `pgvector|vector\(|embedding` anywhere in src/, because that
+   * iteration deferred embeddings to this one. Delivering them means that entry had
+   * to go — it is the feature. It is replaced by the test below, which asserts the
+   * vector support this iteration DOES use is pgvector inside PostgreSQL and
+   * nothing else, so "no vector database" (§45) is still checked; the vector and
+   * search SERVICES stay forbidden below, untouched.
    */
   const FORBIDDEN = [
-    { label: "pgvector or an embedding column", pattern: /pgvector|\bvector\(|embedding/i },
     { label: "Redis", pattern: /\bredis\b|ioredis/i },
     { label: "a queue or worker framework", pattern: /bullmq|pg-boss|\bkafka\b|amqp|celery|sqs/i },
     { label: "cloud object storage", pattern: /aws-sdk|@aws-sdk|s3client|\bgcs\b|azure-storage/i },
     { label: "an authentication library", pattern: /jsonwebtoken|passport|bcrypt|argon2|express-session/i },
-    { label: "a vector or search service", pattern: /pinecone|weaviate|qdrant|elasticsearch|opensearch/i },
+    { label: "a vector or search service", pattern: /pinecone|weaviate|qdrant|chromadb|milvus|elasticsearch|opensearch/i },
+    // §5, §45: one AI provider. A second embedding provider would also mean a second
+    // vector space in one column, which no amount of care downstream can untangle.
+    { label: "a second AI SDK", pattern: /\bopenai\b|@anthropic-ai|@mistralai|\bcohere\b|huggingface|langchain|llamaindex|@ai-sdk/i },
+    // §45: no ORM and no second database client.
+    { label: "an ORM or query builder", pattern: /sequelize|typeorm|\bprisma\b|\bknex\b|drizzle|mikro-orm|objection/i },
   ];
 
   it("appears nowhere in src/", async () => {
     const sources = await readAll(await jsFiles(SRC));
+    // The one real vacuity risk for a check shaped like this is a walker that
+    // returns nothing — every pattern then matches nothing, and the suite is green
+    // on an empty set.
+    assert.ok(Object.keys(sources).length >= 25, "the check must actually read the source tree");
+
     for (const { label, pattern } of FORBIDDEN) {
       const offenders = Object.entries(sources)
-        // Comments stripped: text-chunker.js explains at length why it computes no
-        // embeddings, and a rule that fires on the documentation of its own
-        // deferral is a rule that gets deleted rather than kept.
+        // Comments stripped: several modules explain at length what they
+        // deliberately do NOT use, and a rule that fires on the documentation of
+        // its own deferral is a rule that gets deleted rather than kept.
         .filter(([, source]) => pattern.test(stripComments(source)))
         .map(([file]) => file);
-      assert.deepEqual(offenders, [], `${label} must not appear in src/ this iteration (§2, §30)`);
+      assert.deepEqual(offenders, [], `${label} must not appear in src/ (§2, §45)`);
     }
   });
 
@@ -389,10 +691,41 @@ describe("§27 no deferred infrastructure crept in", () => {
       ...manifest.dependencies,
       ...manifest.devDependencies,
     });
+    assert.ok(installed.length >= 5, "the check must actually read the manifest");
     for (const { label, pattern } of FORBIDDEN) {
       const offenders = installed.filter((name) => pattern.test(name));
-      assert.deepEqual(offenders, [], `${label} must not be installed this iteration (§30)`);
+      assert.deepEqual(offenders, [], `${label} must not be installed (§45)`);
     }
+  });
+
+  it("gets its vector support from pgvector inside PostgreSQL", async () => {
+    /**
+     * The replacement for SP-V2-003's blanket embedding ban, and the reason
+     * removing it was safe. §45's "no vector database" is not satisfied by the
+     * absence of the word "embedding" — it is satisfied by embeddings living in a
+     * `vector` column of the database that already holds the chunks, reached
+     * through the one `pg` client, by a migration in the existing runner.
+     *
+     * All three claims are asserted, so adopting a vector service later would have
+     * to change this test rather than slip past it.
+     */
+    const dir = path.join(BACKEND_ROOT, "migrations", "postgres");
+    const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".sql")).sort();
+    const sql = (
+      await Promise.all(names.map((name) => fs.readFile(path.join(dir, name), "utf8")))
+    ).join("\n");
+
+    assert.match(sql, /CREATE\s+EXTENSION\s+IF\s+NOT\s+EXISTS\s+vector\b/i);
+    assert.match(sql, /\bembedding\s+vector\(\d+\)/i);
+
+    // And nothing but `pg` talks to it.
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(BACKEND_ROOT, "package.json"), "utf8"),
+    );
+    assert.deepEqual(
+      Object.keys(manifest.dependencies).filter((name) => /^(pg|mysql2?|mongodb|mongoose|better-sqlite3|sqlite3)$/.test(name)),
+      ["pg"],
+    );
   });
 
   it("keeps SQLite out of the runtime", async () => {
@@ -468,11 +801,12 @@ describe("§19 /api/ask is untouched by the material pipeline", () => {
 
 describe("the material layer is actually layered", () => {
   it("has one module per responsibility", async () => {
-    // §12 asks for separation of concerns, and this is the cheapest statement of
-    // it: the files exist and are separate. A single 800-line material.service.js
-    // would pass every other check in this file.
-    const present = await jsFiles(path.join(SRC, "materials"));
+    // §12 and SP-V2-004 §3 ask for separation of concerns, and this is the cheapest
+    // statement of it: the files exist and are separate. A single 800-line
+    // material.service.js would pass every other check in this file.
+    const present = await jsFiles(SRC);
     for (const expected of [
+      // SP-V2-003: upload, processing, extraction.
       "src/materials/material.routes.js",
       "src/materials/material.controller.js",
       "src/materials/material.service.js",
@@ -481,6 +815,26 @@ describe("the material layer is actually layered", () => {
       "src/materials/document-extractor.js",
       "src/materials/text-normalizer.js",
       "src/materials/text-chunker.js",
+      // SP-V2-004: embedding, retrieval, chat. Each of these is a separate file
+      // because each is separately testable — the context builder and the source
+      // mapper are pure functions, retrieval needs a database but no model, and only
+      // the chat service needs both.
+      "src/materials/material-chat.controller.js",
+      "src/materials/material-chat.service.js",
+      "src/materials/material-indexing.service.js",
+      "src/materials/retrieval.service.js",
+      "src/materials/retrieval.repository.js",
+      "src/materials/embedding.repository.js",
+      "src/materials/context-builder.js",
+      "src/materials/source-mapper.js",
+      // The provider abstraction (§6) and the prompt (§19) live outside
+      // src/materials, so the feature depends on an interface rather than on Google.
+      "src/ai/embedding.service.js",
+      "src/ai/gemini.client.js",
+      "src/ai/prompts/material-chat.prompt.js",
+      // Vector validation is shared by src/ai and src/materials, so it belongs to
+      // neither — putting it in either would make one import the other.
+      "src/utils/vector.js",
     ]) {
       assert.ok(present.includes(expected), `missing ${expected}`);
     }
@@ -501,12 +855,14 @@ describe("the material layer is actually layered", () => {
 
   it("routes the material endpoints through the central async wrapper", async () => {
     // Without asyncHandler a rejected promise becomes an unhandled rejection
-    // rather than the JSON error §20 requires.
+    // rather than the JSON error §20 requires. Six now: SP-V2-003's five plus
+    // POST /api/materials/chat, which needs it most — it is the one handler that
+    // awaits two network calls.
     const routes = await fs.readFile(
       path.join(SRC, "materials", "material.routes.js"),
       "utf8",
     );
     const handlers = routes.match(/asyncHandler\(/g) ?? [];
-    assert.equal(handlers.length, 5, "all five endpoints (§10) must be wrapped");
+    assert.equal(handlers.length, 6, "all six material endpoints must be wrapped");
   });
 });
