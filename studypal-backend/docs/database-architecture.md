@@ -1,11 +1,16 @@
 # Database Architecture
 
 How StudyPal stores data, and why it stores it that way. Written for SP-V2-002,
-which replaced SQLite with PostgreSQL.
+which replaced SQLite with PostgreSQL, and extended by SP-V2-003 (`materials`,
+`material_chunks`) and SP-V2-004 (pgvector embeddings and the indexing
+lifecycle).
 
 Companion documents: [`current-architecture.md`](./current-architecture.md) for
 the application layers, [`api-contract.md`](./api-contract.md) for the
-request/response contract these tables serve, and
+request/response contract these tables serve,
+[`material-processing.md`](./material-processing.md) for how an upload becomes
+chunks, [`rag-architecture.md`](./rag-architecture.md) for how those chunks
+become searchable, and
 [`security-baseline.md`](./security-baseline.md) for what is and is not
 protected.
 
@@ -21,7 +26,7 @@ preferences:
 | Requirement | SQLite | PostgreSQL |
 | --- | --- | --- |
 | More than one API instance | One process owns the file. Two instances means two writers on one file over a filesystem that may not lock correctly. | A server. Instances are clients. |
-| Uploaded-material search (SP-V2-00x) | No vector type, no trigram index, `LIKE '%x%'` only. | `pgvector` and `pg_trgm` are extensions away — deliberately *not* installed yet. |
+| Uploaded-material search (SP-V2-00x) | No vector type, no trigram index, `LIKE '%x%'` only. | `pgvector` is an extension away — **now installed**, by migration `003`. |
 | Concurrent writes during a study session | One writer at a time; a long write blocks readers unless WAL is tuned. | MVCC. Readers never block writers. |
 | Structured AI output | JSON as `TEXT`, parsed in application code on every read. | `JSONB` — validated on write, queryable, indexable. |
 | Survives a container restart | Only if the file sits on a mounted volume. | Storage is the database server's problem, not the app's. |
@@ -44,8 +49,10 @@ removed from `package.json`, and the old schema is kept unexecuted at
   dependency, a mapping layer and a second thing to learn in exchange for
   nothing.
 - **No migration framework.** See §5.
-- **No Redis, no pgvector, no extensions beyond the default `plpgsql`.** Asserted
-  by a test, so adding one is a deliberate act.
+- **No Redis, no queue, no ORM, and exactly two extensions** — the default
+  `plpgsql` plus `vector`, which migration `003` enables because the retrieval
+  query needs it. `pg_trgm` is still not installed. Asserted by a test, so adding
+  a third is a deliberate act.
 
 ---
 
@@ -104,6 +111,8 @@ materials' chunks, in one statement.
 │ status            TEXT         NOT NULL     │ = 'uploaded'
 │ page_count        INTEGER      NULL         │ NULL for .txt
 │ error_message     TEXT         NULL         │ set iff status = 'failed'
+│ indexing_status   TEXT         NOT NULL     │ = 'pending'  (003)
+│ indexing_error    TEXT         NULL         │ set iff indexing_status='failed'
 │ created_at        TIMESTAMPTZ  NOT NULL     │
 │ updated_at        TIMESTAMPTZ  NOT NULL     │
 └─────────────────────────────────────────────┘
@@ -117,6 +126,7 @@ materials' chunks, in one statement.
 │ content      TEXT         NOT NULL          │
 │ page_number  INTEGER      NULL              │ NULL when unknown
 │ char_count   INTEGER      NOT NULL          │ = char_length(content)
+│ embedding    vector(1536) NULL              │ NULL until indexed  (003)
 │ created_at   TIMESTAMPTZ  NOT NULL          │
 └─────────────────────────────────────────────┘
 
@@ -140,16 +150,30 @@ the filesystem: deleting a user through SQL orphans their uploaded bytes on disk
 Nothing does that today, and it is recorded as a limitation in §9 rather than
 worked around with a trigger.
 
-**Embeddings and pgvector are intentionally deferred to SP-V2-004.**
-`material_chunks` deliberately has no vector column. The next iteration adds one
-with `ALTER TABLE … ADD COLUMN embedding vector(n)` — a nullable add that
-rewrites no rows — plus an index; nothing here has to be restructured for it. See
-[`material-processing.md`](./material-processing.md) §15.
+**Embeddings live in `material_chunks.embedding`**, added by migration `003` as
+002 predicted: a nullable `ALTER TABLE … ADD COLUMN embedding vector(1536)` that
+rewrites no rows. NULL is a legitimate state — a chunk exists the moment the
+processing pipeline persists it, and embedding happens afterwards over the
+network, so a `NOT NULL` column would force the two into one transaction held
+open across a Gemini call.
+
+`materials.indexing_status` is a **second, orthogonal lifecycle column** rather
+than new values in `status`: `ready` means the document was parsed and chunked,
+`indexed` means it is searchable, and a material can be one without the other.
+Widening `status` instead would have silently redefined `ready` to mean less than
+it already did, while every existing test and client kept passing.
+
+**No ANN index on the vector column**, deliberately — exact search has perfect
+recall, and the user filter already reduces each query to tens or low thousands of
+candidate rows. The full reasoning, the trigger for revisiting it, and the one
+`CREATE INDEX` it would take are in
+[`rag-architecture.md`](./rag-architecture.md) §4 and inline in the migration.
 
 The full DDL, with a comment on every non-obvious decision, is
-[`migrations/postgres/001_core_schema.sql`](../migrations/postgres/001_core_schema.sql)
+[`migrations/postgres/001_core_schema.sql`](../migrations/postgres/001_core_schema.sql),
+[`migrations/postgres/002_materials.sql`](../migrations/postgres/002_materials.sql)
 and
-[`migrations/postgres/002_materials.sql`](../migrations/postgres/002_materials.sql).
+[`migrations/postgres/003_material_embeddings.sql`](../migrations/postgres/003_material_embeddings.sql).
 Those files are the source of truth; this section describes them.
 
 ### `users` replaces `sessions`
@@ -267,6 +291,20 @@ chunk-count aggregate — so §29's "index chunk ordering" is satisfied by a
 constraint that had to exist anyway. Adding a second index on `material_id` alone
 would duplicate that one's leading column for no gain.
 
+**And no index on `material_chunks.embedding`.** pgvector's HNSW and IVFFlat are
+*approximate*: they trade recall for speed. Retrieval here answers a student's
+question from their own notes, where a missed chunk is a wrong answer or a false
+"your materials do not cover this" — recall is the product. The per-user (and
+often per-material) filter already reduces each query to tens or low thousands of
+candidate rows, which is a fast exact scan, whereas an ANN index is built over the
+whole table and searched *before* that filter is applied, so at this scale it can
+return fewer than K rows for the user while also being less accurate. Exact search
+is intentional and documented; §4 of [`rag-architecture.md`](./rag-architecture.md)
+records the trigger for revisiting it and the single `CREATE INDEX … USING hnsw
+(embedding vector_cosine_ops)` it would take. `materials.indexing_status` gets no
+index either — the one query filtering on it is already scoped by primary key, and
+a single-column index on a four-value column would never be chosen.
+
 `tests/schema.test.js` asserts the exact index list on `questions`, and
 `tests/materials/schema.test.js` does the same for both material tables, so
 adding one fails a test and prompts a justification. Both suites also run
@@ -314,6 +352,16 @@ round trips for nothing. Current callers:
    row that does not exist.
 2. **The migration runner** — each migration file, so a failure half-way leaves
    no partial schema.
+3. **Embedding persistence** — every vector for one material plus its
+   `indexing_status` in one transaction, so a material can never be marked
+   `indexed` with some of its chunks unembedded.
+
+**No transaction is ever held open across a provider call.** Indexing reads the
+chunks needing embeddings (connection taken and released), calls Gemini with
+nothing held however long it takes, then writes vectors and status in the one
+transaction above. Embedding chunk-by-chunk inside the persistence transaction
+would hold a pooled connection for every network round trip, and `DB_POOL_MAX` is
+10. `POST /api/materials/chat` holds no transaction at all.
 
 ### Failure behaviour
 
@@ -444,23 +492,29 @@ planner uses an index — which is most of what these tests are for.
 **Gemini is faked**, by a `node --import` preload that replaces global `fetch`
 for provider requests only (`tests/helpers/fake-gemini.mjs`). The provider is a
 paid third party and its output is nondeterministic; the database is neither. No
-API key is needed to run the suite.
+API key is needed to run the suite. The same preload fakes **embedding** requests
+as well as generation, each with its own switch for the failure modes — and the
+retrieval tests use fixture vectors built from an orthonormal basis, so
+similarity scores and nearest-neighbour ordering are exact known values rather
+than whatever a provider happens to return.
 
 ### Local setup
 
 ```bash
 cd studypal-backend
 cp .env.example .env          # then set POSTGRES_PASSWORD
-npm run db:up                 # postgres:16-alpine on 127.0.0.1:5434
+npm run db:up                 # pgvector/pgvector:pg16 on 127.0.0.1:5434
 npm run migrate
 npm test
 ```
 
-`compose.yaml` pins `postgres:16-alpine`, binds only to `127.0.0.1`, and takes
-its password from the environment with no default — `POSTGRES_PASSWORD:?` fails
-the command rather than starting a database with a known password. Port **5434**
-rather than 5432, so it cannot collide with a PostgreSQL already installed on the
-host. Nothing about it is committed except the compose file itself.
+`compose.yaml` pins **`pgvector/pgvector:pg16`** — not the official `postgres`
+image, which does not ship the `vector` extension that migration `003` requires —
+binds only to `127.0.0.1`, and takes its password from the environment with no
+default: `POSTGRES_PASSWORD:?` fails the command rather than starting a database
+with a known password. Port **5434** rather than 5432, so it cannot collide with a
+PostgreSQL already installed on the host. Nothing about it is committed except the
+compose file itself.
 
 ---
 
@@ -493,19 +547,24 @@ name that none of the reserved tables exist, so creating one early fails a test.
 
 | Feature | Expected shape | Attaches to |
 | --- | --- | --- |
-| Semantic search over materials | `material_chunks.embedding` (a new nullable column), the `pgvector` extension, an HNSW index on it | The table `materials`/`material_chunks` already provide; **SP-V2-004** |
 | Study plans | `study_plans`, `study_plan_tasks` | `study_plans.user_id → users.id` |
 | Exams and attempts | `exams`, `exam_questions`, `exam_attempts`, `attempt_answers` | `exams.user_id → users.id` |
 | Learning analytics | `learning_events` | `learning_events.user_id → users.id` |
 | Real accounts | `password_hash`, `email_verified_at` on `users`; a `sessions` table that actually holds sessions | The nullable columns already on `users` |
+| Multi-turn material chat | `conversations`, `conversation_messages` | `conversations.user_id → users.id`; each question is independent today |
 
-Uploaded study materials **have now been built** — SP-V2-003 created `materials`
-and `material_chunks`, so they have moved out of this table and into §2. What that
-ticket deliberately did *not* create is the embedding column, and
-**embeddings and pgvector are intentionally deferred to SP-V2-004**:
-`tests/materials/architecture.test.js` asserts by grep that no vector column,
-`pgvector` dependency or embedding call exists yet, so starting early fails a
-test the same way an early table would.
+Two rows have left this table by being built. SP-V2-003 created `materials` and
+`material_chunks`, and **SP-V2-004 added semantic search over them** — the
+`vector` extension, `material_chunks.embedding` as `vector(1536)`, and the
+`indexing_status` lifecycle, all in migration `003`. Both now live in §2, and
+[`rag-architecture.md`](./rag-architecture.md) documents the retrieval path.
+
+What `003` deliberately did **not** create is an ANN index on the vector column:
+exact search has perfect recall, the per-user filter keeps each query small, and
+an approximate index searched before that filter can return fewer than K rows for
+the user *and* be less accurate. `tests/materials/schema.test.js` asserts the
+exact index list on these tables, so adding one fails a test and demands a
+justification — the same rule every other index here is held to.
 
 Everything hangs off `users.id`, which is the reason SP-V2-002 introduced a
 surrogate key rather than keying `questions` on `username`. Each of these is a
@@ -528,3 +587,6 @@ new numbered file in `migrations/postgres/`; the existing ones are immutable.
 | 9 | `materials.updated_at` is maintained by the repository, not by a trigger | Every status transition sets it in its `UPDATE`. A future writer that forgets to would leave it stale, the same exposure as limitation 4. |
 | 10 | `material_chunks.content` is stored inline, so PostgreSQL TOASTs and compresses it | Fine at a 10 MB upload cap: a chunk is ~1800 characters and a large document is a few thousand rows. A corpus large enough to care would want the text out of the row, which is a decision for whichever iteration hits it. |
 | 11 | No deduplication of identical uploads | The same document uploaded twice is two `materials` rows, two storage keys and two chunk sets. Content addressing would fix it and is a later decision. |
+| 12 | The embedding dimension is baked into the DDL as `vector(1536)` | `STUDYPAL_EMBEDDING_DIM` is validated against it at startup only as a **warning**, not a refusal. Set them differently and uploads still succeed, extraction still succeeds, and every embedding write then fails at the column's type check — visible as `indexing_status = 'failed'`, not as a startup error. Changing the dimension for real is a new migration plus a full re-index, never a config edit. |
+| 13 | **A vector is bigger than the text it indexes.** 1536 four-byte floats is ~6 KB per chunk against ~1.8 KB of content | Indexing roughly quadruples what a material costs on disk. Acceptable at a 10 MB upload cap and one of the three reasons the dimension is 1536 rather than the model's native 3072; a much larger corpus would want a smaller dimension or the vectors in their own table. |
+| 14 | **Nothing detects a mixed embedding space.** Vectors written under one model and a query embedded under another are still comparable *to PostgreSQL* | `<=>` returns a number for any two vectors of equal width, so the failure mode is not an error but confident nonsense in the ranking. No column records which model produced a row. The remedy is `reindexMaterial` run deliberately after any model change, which is why that consequence is documented in three places rather than left to be discovered. |

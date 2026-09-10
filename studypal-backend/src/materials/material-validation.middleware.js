@@ -139,3 +139,90 @@ export function validateMaterialId(req, _res, next) {
   req.validated = { ...req.validated, id };
   next();
 }
+
+/**
+ * Validate the JSON body of POST /api/materials/chat.
+ *
+ * §14's four checks — username, question, optional material scope, question
+ * length — in the order that produces the most useful message: identity first,
+ * then the question's presence, then its size, then the optional fields.
+ *
+ * The length bound is the one worth dwelling on. An enormous "question" is not a
+ * more detailed query; embedding models truncate their input, so the tail would
+ * be billed for and then not participate in the search, producing a retrieval
+ * that silently ignored most of what was asked. Rejecting it is more honest than
+ * embedding a prefix and calling the result an answer to the whole thing. §14's
+ * "do not allow enormous prompts to become retrieval queries" is this check.
+ */
+export function validateChatBody(req, _res, next) {
+  // `?? {}` for the same reason validateUploadBody does it: with no body at all,
+  // `req.body` is undefined and destructuring would be a 500 for a plain 400.
+  const body = req.body ?? {};
+
+  if (typeof body.username !== "string" || !body.username.trim()) {
+    return next(badRequest("Username is required."));
+  }
+  const username = body.username.trim();
+  if (username.length > config.limits.usernameLength) {
+    return next(
+      badRequest(
+        `Username must be ${config.limits.usernameLength} characters or fewer.`,
+      ),
+    );
+  }
+
+  // Presence and emptiness are one check with one message. A missing key and a
+  // `"   "` of whitespace are the same request as far as retrieval is concerned —
+  // there is nothing to embed — and two different 400s would imply a distinction
+  // the caller can act on.
+  if (typeof body.question !== "string" || !body.question.trim()) {
+    return next(badRequest("Question is required."));
+  }
+  const question = body.question.trim();
+
+  // Measured AFTER trimming, so 2000 characters of question plus trailing
+  // whitespace is accepted rather than rejected for padding the client probably
+  // did not intend to send.
+  if (question.length > config.rag.maxQuestionChars) {
+    return next(
+      badRequest(
+        `Question must be ${config.rag.maxQuestionChars} characters or fewer.`,
+      ),
+    );
+  }
+
+  // Optional. Absent and null both mean "search everything this user owns"; a
+  // present-but-malformed value is an error rather than a silent widening of the
+  // scope, because a client that meant to scope a search and got a corpus-wide
+  // one could not tell from the response.
+  let materialId = null;
+  if (body.materialId !== undefined && body.materialId !== null) {
+    if (
+      typeof body.materialId !== "number" ||
+      !Number.isSafeInteger(body.materialId) ||
+      body.materialId < 1
+    ) {
+      return next(badRequest("Material id must be a positive integer."));
+    }
+    materialId = body.materialId;
+  }
+
+  // Also optional, and also a hint rather than a contract: the service clamps it
+  // to config.rag.maxTopK. Only obvious nonsense is rejected here — a negative
+  // count or a non-integer is a malformed request, whereas 500 is a legitimate
+  // request for more context than the server will give, and gets the maximum.
+  let topK;
+  if (body.topK !== undefined && body.topK !== null) {
+    if (
+      typeof body.topK !== "number" ||
+      !Number.isSafeInteger(body.topK) ||
+      body.topK < 1
+    ) {
+      return next(badRequest("topK must be a positive integer."));
+    }
+    topK = body.topK;
+  }
+
+  req.validated = { ...req.validated, username, question, materialId, topK };
+  next();
+}

@@ -40,6 +40,7 @@ import { badRequest, notFound } from "../utils/app-error.js";
 import { validateUpload } from "./file-validation.js";
 import * as materialRepository from "./material.repository.js";
 import { processMaterial } from "./material-processing.service.js";
+import { indexMaterial } from "./material-indexing.service.js";
 
 /**
  * The API's view of a material.
@@ -63,6 +64,27 @@ import { processMaterial } from "./material-processing.service.js";
  * documented in docs/material-processing.md rather than fixed by changing a live
  * contract.
  *
+ * TWO LIFECYCLES, TWO FIELDS (SP-V2-004 §7)
+ * -----------------------------------------
+ * `status` and `indexingStatus` are reported separately because they answer
+ * different questions, and merging them would have made one of the answers
+ * unavailable:
+ *
+ *   status         can this document be read? (extracted, chunked, stored)
+ *   indexingStatus can it be searched?        (chunks have vectors)
+ *
+ * `status: "ready"` kept the meaning SP-V2-003 gave it — successfully processed —
+ * rather than being quietly widened to "processed AND indexed", which would have
+ * changed what a value already in the database and already in a live contract
+ * means. A material can be perfectly readable and not yet searchable, and a
+ * student polling after an upload needs to be able to tell.
+ *
+ * The one combination worth explaining is `status: "failed"` with
+ * `indexingStatus: "pending"`. A material that never produced chunks has no
+ * embedding work outstanding, so nothing will ever move its indexing state — but
+ * `pending` is still the truthful value (indexing has not run and has not failed),
+ * and the failed `status` alongside it already explains why it never will.
+ *
  * @param {object} row a materials row with the repository's public columns
  * @param {number} [chunkCount] included when the caller has counted them
  * @returns {object}
@@ -78,6 +100,10 @@ function toApiShape(row, chunkCount) {
     // client can read `pageCount` without checking whether it exists, and a null
     // says "this format has no pages or the parser could not tell" (§13).
     pageCount: row.page_count ?? null,
+    // Always present, never null — the column is NOT NULL with a default, so a
+    // missing value here would mean a repository stopped selecting it, and a `??`
+    // fallback would hide that rather than let a test catch it.
+    indexingStatus: row.indexing_status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -89,6 +115,13 @@ function toApiShape(row, chunkCount) {
   // report, rather than sent as null — an `error` key that is present but empty
   // reads like a bug in a client that checks for the key's existence.
   if (row.error_message) view.error = row.error_message;
+
+  // The same treatment for the indexing lifecycle's error, and a separate key
+  // rather than reusing `error`: the two failures are independent, a material can
+  // have either or both, and one key would make "readable but not searchable"
+  // indistinguishable from "unreadable". Also the sanitised string written by
+  // material-indexing.service.js — no provider, model or quota detail (§32).
+  if (row.indexing_error) view.indexingError = row.indexing_error;
 
   return view;
 }
@@ -104,6 +137,7 @@ function toApiShape(row, chunkCount) {
  *   3. write the file to storage
  *   4. insert the material row as `uploaded`
  *   5. process it to `ready` or `failed`
+ *   6. index it — embed its chunks, if it has any
  *
  * Step 3 before step 4 means a storage failure leaves no row. Step 4 failing
  * after step 3 would leave a file with no row — an orphan — so that path deletes
@@ -114,6 +148,20 @@ function toApiShape(row, chunkCount) {
  * its file. That is deliberate. The student uploaded something, they should see it
  * in their list with a reason it did not work, and they should be able to delete
  * it themselves. Deleting it for them would make a failed upload silently vanish.
+ *
+ * STEP 6 IS A SEPARATE STEP FOR A REASON (SP-V2-004)
+ * --------------------------------------------------
+ * Indexing is called from here rather than from inside processMaterial, which
+ * keeps material-processing.service.js deterministic, offline and free of any
+ * provider dependency — see material-indexing.service.js for the full argument.
+ * The consequence for this function is that upload now makes a network call to
+ * Google, so it is slower than it was and it can be affected by an outage.
+ *
+ * It cannot FAIL because of one, though: indexMaterial never throws. An upload
+ * that stored and extracted a document successfully returns 201 even when the
+ * embedding provider is unreachable, and says so in `indexingStatus` rather than
+ * discarding the work. §9's "leave the material non-indexed and do not claim it is
+ * searchable" is that field.
  *
  * @param {object} input
  * @param {string} input.username
@@ -169,13 +217,50 @@ export async function uploadMaterial({ username, file }) {
     mimeType,
   });
 
+  // Skipped for a failed material rather than left to the no-op path inside
+  // indexMaterial. A material that never produced chunks has nothing to embed, and
+  // saying that here — where the reader can see `status` — is clearer than two
+  // queries that discover it.
+  const indexed =
+    processed.status === "ready" ? await indexAfterUpload(processed, user.id) : processed;
+
   // Counted rather than assumed: the response's chunkCount comes from the
   // database, so it reports what was actually persisted. Zero for a failed
   // material, which is correct — markFailed removes any chunks from an earlier
   // attempt.
-  const chunkCount = await materialRepository.countChunks(processed.id);
+  const chunkCount = await materialRepository.countChunks(indexed.id);
 
-  return toApiShape(processed, chunkCount);
+  return toApiShape(indexed, chunkCount);
+}
+
+/**
+ * Index a freshly processed material and return its post-indexing row.
+ *
+ * The re-read is the point. `processed` was captured before indexing ran, so its
+ * `indexing_status` is whatever it was then — `pending` — and returning it would
+ * have the response tell a client "not indexed yet" about a material that is, at
+ * that very moment, indexed. The client would poll /status once to learn something
+ * the upload response could have told it.
+ *
+ * Reading the row back rather than deriving the status from indexMaterial's return
+ * value keeps ONE authority for what a material's indexing state is: the table.
+ * The derivation already exists, in SQL, inside saveEmbeddingsAndMarkIndexed —
+ * reproducing it here from `{indexed, failed}` booleans would be a second copy to
+ * keep in agreement with the first.
+ *
+ * @param {object} processed the row processMaterial returned
+ * @param {number} userId
+ * @returns {Promise<object>} the material row, re-read after indexing
+ */
+async function indexAfterUpload(processed, userId) {
+  await indexMaterial({ materialId: processed.id });
+
+  // Absent only if the material was deleted while this upload was still running —
+  // possible, since DELETE takes an id and this request has not returned one yet.
+  // The pre-index snapshot is then the most accurate thing left to describe what
+  // the upload did, and it beats a TypeError on a path that genuinely succeeded.
+  const reread = await materialRepository.findOwnedById(processed.id, userId);
+  return reread ?? processed;
 }
 
 /**
@@ -220,10 +305,16 @@ export async function getMaterial({ id, username }) {
 /**
  * A material's processing status.
  *
- * A deliberately narrow response — id, status, pageCount, chunkCount and a safe
- * error — because this is the endpoint a client polls. It is a subset of what GET
- * /api/materials/:id returns rather than a different shape, so nothing new has to
- * be learned to read it.
+ * A deliberately narrow response — id, status, pageCount, chunkCount, the indexing
+ * state and a safe error for each lifecycle — because this is the endpoint a client
+ * polls. It is a subset of what GET /api/materials/:id returns rather than a
+ * different shape, so nothing new has to be learned to read it.
+ *
+ * `indexingStatus` belongs here specifically BECAUSE this is the polled endpoint:
+ * "can I ask questions about this document yet?" is the question a client polls to
+ * answer, and before SP-V2-004 `status: "ready"` was a complete answer to it. It no
+ * longer is, so the field a client now needs has to be reachable from the same
+ * request rather than only from GET /api/materials/:id.
  *
  * @param {object} input
  * @param {number} input.id
@@ -240,8 +331,10 @@ export async function getMaterialStatus({ id, username }) {
     status: material.status,
     pageCount: material.page_count ?? null,
     chunkCount,
+    indexingStatus: material.indexing_status,
   };
   if (material.error_message) status.error = material.error_message;
+  if (material.indexing_error) status.indexingError = material.indexing_error;
   return status;
 }
 

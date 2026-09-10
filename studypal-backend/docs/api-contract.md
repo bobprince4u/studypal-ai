@@ -19,6 +19,22 @@
 > tests: `total_questions` is a JSON **number** (`BIGINT` renders as a string by
 > default in `pg`) and every `created_at` is the same ISO-8601 string form as
 > before (`TIMESTAMPTZ` yields a `Date` by default). See §8.
+>
+> **SP-V2-003 and SP-V2-004 added no deviation either, and are not documented
+> here.** They *added* endpoints — the five under `/api/materials` and
+> `POST /api/materials/chat` — without changing any of the five below, which is
+> asserted by the same 35 baseline tests plus a dedicated
+> "`/api/ask` is untouched" suite in `tests/materials/architecture.test.js`. Their
+> contracts live with their features: §9 of
+> [`material-processing.md`](./material-processing.md) for the material endpoints,
+> §6 of [`rag-architecture.md`](./rag-architecture.md) for the chat endpoint. So
+> this file remains what it says it is — the frozen contract of the five original
+> endpoints, measured rather than inferred.
+>
+> One consequence worth naming, because it looks like an inconsistency and is one:
+> the newer endpoints use **camelCase** while `/api/history` and `/api/progress`
+> use snake_case. That is deliberate — fixing it would mean editing a contract this
+> document exists to freeze. See §13 of `material-processing.md`.
 
 - Base URL: `http://localhost:4000` (override with `PORT`)
 - Frontend base URL: `process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000"`

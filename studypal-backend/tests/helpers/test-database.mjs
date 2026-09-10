@@ -172,6 +172,31 @@ function adminPool(url) {
 let sequence = 0;
 
 /**
+ * The base test database every per-run database is copied from.
+ *
+ * Captured the first time it is read, because `useIsolatedDatabase` overwrites
+ * STUDYPAL_TEST_DATABASE_URL with a per-run name and a later call must still copy
+ * the template rather than the previous suite's database.
+ */
+let templateUrl = null;
+
+function baseDatabaseUrl() {
+  templateUrl ??= testDatabaseUrl();
+  return templateUrl;
+}
+
+/**
+ * A per-run database name that traces back to the suite that made it.
+ *
+ * Postgres identifiers cap at 63 bytes, so the label is truncated rather than
+ * silently mangled.
+ */
+function isolatedName(baseName, label) {
+  const safeLabel = label.replace(/[^a-z0-9]+/gi, "_").toLowerCase().slice(0, 12);
+  return `${baseName}_run_${process.pid}_${++sequence}_${safeLabel}`.slice(0, 63);
+}
+
+/**
  * Create a private, migrated database and return its connection string.
  *
  * The first call migrates the base test database, which then acts as a template.
@@ -181,22 +206,25 @@ let sequence = 0;
  * @param {object} [options]
  * @param {string} [options.label] included in the name, to make a leftover
  *   database traceable to the suite that made it
+ * @param {boolean} [options.claim] point THIS process's application config at the
+ *   new database. See useIsolatedDatabase, which is the way to ask for that.
  * @returns {Promise<{url: string, name: string, drop: () => Promise<void>}>}
  */
-export async function createIsolatedDatabase({ label = "suite" } = {}) {
-  const baseUrl = testDatabaseUrl();
+export async function createIsolatedDatabase({ label = "suite", claim = false } = {}) {
+  const baseUrl = baseDatabaseUrl();
   const baseName = assertTestDatabase(baseUrl);
 
-  await ensureTemplateMigrated(baseUrl);
-
-  // Postgres identifiers cap at 63 bytes, so the label is truncated rather than
-  // silently mangled.
-  const safeLabel = label.replace(/[^a-z0-9]+/gi, "_").toLowerCase().slice(0, 12);
-  const name = `${baseName}_run_${process.pid}_${++sequence}_${safeLabel}`.slice(
-    0,
-    63,
-  );
+  const name = isolatedName(baseName, label);
   const url = withDatabase(baseUrl, name);
+
+  if (claim) {
+    // BEFORE ensureTemplateMigrated, and that ordering is the entire point — see
+    // useIsolatedDatabase's docstring for why.
+    process.env.NODE_ENV = "test";
+    process.env.STUDYPAL_TEST_DATABASE_URL = url;
+  }
+
+  await ensureTemplateMigrated(baseUrl);
 
   // Under the lock: CREATE DATABASE … TEMPLATE fails outright if any other
   // session is connected to the template, and with three test files running in
@@ -226,6 +254,41 @@ export async function createIsolatedDatabase({ label = "suite" } = {}) {
       }
     },
   };
+}
+
+/**
+ * Create a private migrated database AND make it the one this process's
+ * application modules will talk to.
+ *
+ * For suites that import src/ — a repository, a service — rather than driving a
+ * spawned server. Those cannot use server-harness.mjs, which passes the database
+ * URL to a child process's environment, so the URL has to be in place before
+ * src/config/env.js is first evaluated. env.js reads process.env exactly once, at
+ * module initialization, and ESM has no way to unload it afterwards.
+ *
+ * WHY THIS IS A SEPARATE FUNCTION rather than something a caller can do itself:
+ * provisioning a database imports src/db/migrator.js, which imports
+ * src/config/database.js, which imports src/config/env.js. So by the time
+ * createIsolatedDatabase returns a URL, the application has ALREADY resolved a
+ * different one — the template's — and a caller setting the variable afterwards
+ * changes nothing at all. It fails silently, and what it silently does is point
+ * the suite at the shared template that every other database is copied from.
+ * Setting NODE_ENV and the URL between naming the database and provisioning it is
+ * the only order that works, and it belongs here rather than in each suite.
+ *
+ * Call it at the very top of the file, before importing anything from src/, and
+ * assert the result:
+ *
+ *   const database = await useIsolatedDatabase({ label: "retrieval" });
+ *   const { config } = await import("../../src/config/env.js");
+ *   assert.equal(config.database.url, database.url);
+ *
+ * @param {object} [options]
+ * @param {string} [options.label]
+ * @returns {Promise<{url: string, name: string, drop: () => Promise<void>}>}
+ */
+export async function useIsolatedDatabase({ label = "inprocess" } = {}) {
+  return createIsolatedDatabase({ label, claim: true });
 }
 
 /**

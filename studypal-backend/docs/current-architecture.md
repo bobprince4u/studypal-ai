@@ -875,10 +875,10 @@ highest-value security gap.
 | --- | --- | --- |
 | Study Plan Generator | `users.id` to hang plans off; the migration runner; the repository pattern | `study_plans` / `study_plan_tasks` migration, `plan.service`, `plan.repository`, a prompt |
 | Exam Simulator | same, plus JSONB for storing generated question sets and the three-tier JSON repair | `exams` / `exam_questions` / `exam_attempts` / `attempt_answers`, timing and scoring |
-| RAG study-material chat | the PostgreSQL decision is made and the server is running; `upload.service` already isolates extraction | `CREATE EXTENSION vector`, a `materials` / `material_chunks` migration, an embedding call, an HNSW index |
+| ~~RAG study-material chat~~ | **Built.** SP-V2-003 shipped `materials` / `material_chunks` and the ingestion pipeline; SP-V2-004 shipped `CREATE EXTENSION vector`, `material_chunks.embedding`, retrieval and `POST /api/materials/chat` | Only the HNSW index this row predicted — and that was **deliberately not built**: exact search has perfect recall and the per-user filter already keeps each query small. See [`rag-architecture.md`](./rag-architecture.md) §4 and [`material-processing.md`](./material-processing.md) §15 for what else the prediction got wrong |
 | Learning analytics | `questions` is relational and indexed by user; `topic` is a real column | `learning_events`, and per-question correctness — which the exam work produces |
 | Real accounts | `users` with unique username, a nullable-unique `email`, and `display_name` / `education_level` already in place | `password_hash`, `email_verified_at`, a real `sessions` table, and the product decision about what an account is (S1) |
-| Horizontal scaling | PostgreSQL is a server; multiple instances are fine | a shared store for rate limiting (S7), if that is per-user rather than per-IP |
+| Horizontal scaling | PostgreSQL is a server; multiple instances are fine | a shared store for rate limiting (S7), if that is per-user rather than per-IP — **and shared object storage**, which SP-V2-003's node-local upload directory now also requires |
 
 Everything above attaches to `users.id`, which is why this ticket introduced a
 surrogate key rather than continuing to key `questions` on a username string.
@@ -887,3 +887,22 @@ immutable.
 
 Schema, index justifications, connection management and the test-database
 strategy in full: [`database-architecture.md`](./database-architecture.md).
+
+> **This document stops at SP-V2-002.** The two feature tickets that followed did
+> not add a §18 and §19 here; they wrote their own documents, because each is a
+> feature's architecture rather than a change to the application's shape. Read
+> [`material-processing.md`](./material-processing.md) for upload, extraction,
+> chunking and storage, and [`rag-architecture.md`](./rag-architecture.md) for
+> embeddings, retrieval, grounding and the chat endpoint. §16.2's tree is a
+> point-in-time snapshot and has been stale since SP-V2-002 replaced SQLite — the
+> **current** layout is in `README.md`.
+>
+> §16.3's four layer rules do still hold, with one wording correction. Rule 3 says
+> "only `src/repositories/` knows SQL"; both feature tickets are
+> **feature-foldered**, so their repositories live in `src/materials/` instead. The
+> rule as enforced is "SQL only in a `*.repository.js`, and Google's SDK only in
+> `src/ai/gemini.client.js`" — and it is enforced, by grep, in
+> `tests/materials/architecture.test.js`, which is the same four rules turned into
+> 34 assertions rather than the shell one-liners in §16.3. It permits exactly one
+> named exception, `src/services/question.service.js`'s inline user upsert, which
+> predates SP-V2-003 and is asserted not to grow.

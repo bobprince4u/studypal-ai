@@ -14,7 +14,20 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector's image, not plain `postgres`, because SP-V2-004 runs
+    # `CREATE EXTENSION vector` in migration 003 and the official postgres image
+    # does not ship pgvector — the extension is simply not in
+    # /usr/share/postgresql/16/extension, so the migration fails with
+    # `could not open extension control file`. This is the same PostgreSQL 16
+    # with one extension added, not a different database.
+    #
+    # NOTE FOR EXISTING VOLUMES: this replaced postgres:16-alpine, which is musl.
+    # This image is Debian, so glibc, and the two disagree about text collation.
+    # An existing studypal_pgdata volume will still start, but string indexes
+    # built under musl are no longer guaranteed correct. For a development
+    # database the honest fix is `docker compose down -v` and `npm run migrate`;
+    # if the data matters, `REINDEX DATABASE studypal` after the first start.
+    image: pgvector/pgvector:pg16
     container_name: studypal-postgres
     restart: unless-stopped
     ports:

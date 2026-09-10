@@ -35,10 +35,16 @@ import { query, withTransaction } from "../config/database.js";
  * Columns the API layer is allowed to see. `storage_key` is absent on purpose —
  * it is fetched only by the functions that need to touch storage, and never by
  * the ones whose result is serialised.
+ *
+ * `embedding` is absent for the same reason `content` is, only more so: 1536
+ * floats per chunk is a large payload that no endpoint has any use for, and a
+ * vector is not information a client can act on.
  */
 const PUBLIC_COLUMNS = `
   id, user_id, original_filename, mime_type, file_size,
-  status, page_count, error_message, created_at, updated_at
+  status, page_count, error_message,
+  indexing_status, indexing_error,
+  created_at, updated_at
 `;
 
 /**
@@ -50,7 +56,9 @@ const PUBLIC_COLUMNS = `
  */
 const PUBLIC_COLUMNS_QUALIFIED = `
   m.id, m.user_id, m.original_filename, m.mime_type, m.file_size,
-  m.status, m.page_count, m.error_message, m.created_at, m.updated_at
+  m.status, m.page_count, m.error_message,
+  m.indexing_status, m.indexing_error,
+  m.created_at, m.updated_at
 `;
 
 /**
@@ -271,6 +279,17 @@ export async function saveChunksAndMarkReady({ materialId, chunks, pageCount }) 
               -- would otherwise keep a stale error, and
               -- materials_error_message_matches_status would reject the row.
               error_message = NULL,
+              -- Back to 'pending', because the chunks above are NEW ROWS with a
+              -- NULL embedding: the DELETE + INSERT replaced the chunk set
+              -- wholesale, so any vectors from a previous run are gone with the
+              -- rows they described. This is what makes §8 free — there is no
+              -- content hash to maintain and no window in which an embedding
+              -- describes text that has since changed, because changed text is
+              -- never the same row. Leaving indexing_status alone here would be
+              -- the actual bug: a re-processed material would claim to be
+              -- 'indexed' with every embedding NULL.
+              indexing_status = 'pending',
+              indexing_error = NULL,
               updated_at = now()
         WHERE id = $1
         RETURNING ${PUBLIC_COLUMNS}`,
@@ -315,6 +334,13 @@ export async function markFailed(id, safeMessage) {
       `UPDATE materials
           SET status = 'failed',
               error_message = $2,
+              -- 'pending', not 'failed'. Indexing did not fail — it never ran,
+              -- and after the DELETE above there is nothing to index. Writing
+              -- 'failed' here would attribute an extraction failure to the
+              -- embedding provider and make indexing_error say something untrue
+              -- about why.
+              indexing_status = 'pending',
+              indexing_error = NULL,
               updated_at = now()
         WHERE id = $1
         RETURNING ${PUBLIC_COLUMNS}`,

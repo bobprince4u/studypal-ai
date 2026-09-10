@@ -58,6 +58,61 @@ function list(name) {
   ];
 }
 
+/**
+ * Parse a similarity threshold: a number in [0, 1].
+ *
+ * `int()` cannot be reused for this, and not only because it rejects fractions —
+ * it rejects 0, which is a meaningful value here (accept every retrieved chunk
+ * regardless of score). A separate parser also keeps the error message
+ * specific: "expected a number between 0 and 1" tells you the domain, whereas
+ * "expected a positive integer" would be actively misleading for a threshold.
+ */
+function ratio(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number.parseFloat(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    throw new Error(
+      `Invalid ${name}: expected a number between 0 and 1 inclusive, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Parse the embedding dimensionality, rejecting values the model cannot produce.
+ *
+ * gemini-embedding-001 supports Matryoshka output between 128 and 3072. A value
+ * outside that range is not a preference, it is a request the provider will
+ * reject on every call — so this throws at startup rather than at the first
+ * upload. The check is against the *model's* range; whether the value matches
+ * the migrated column width is a separate question that configWarnings() raises,
+ * because only a migration can answer it.
+ */
+function dimensions(name, fallback) {
+  const n = int(name, fallback);
+  if (n < 128 || n > 3072) {
+    throw new Error(
+      `Invalid ${name}: gemini-embedding-001 supports 128 to 3072 dimensions, got ${n}. ` +
+        "Note that changing this from the migrated width also requires a migration " +
+        "and re-embedding every chunk — see migrations/postgres/003_material_embeddings.sql.",
+    );
+  }
+  return n;
+}
+
+/**
+ * The width `material_chunks.embedding` was actually created with, in
+ * migrations/postgres/003_material_embeddings.sql.
+ *
+ * Duplicated here on purpose, as the one thing this module knows about the
+ * schema, so that a mismatch is reported at startup by a process that has not
+ * yet tried to insert anything. PostgreSQL would otherwise report it as
+ * `expected 1536 dimensions, not 768` on every chunk of every upload, from deep
+ * inside the indexing path, where it reads like a bug rather than a setting.
+ */
+const MIGRATED_EMBEDDING_DIMENSIONS = 1536;
+
 const nodeEnv = process.env.NODE_ENV || "development";
 
 // ── storage directory ─────────────────────────────────────────────────────────
@@ -262,6 +317,117 @@ export const config = Object.freeze({
     timeoutMs: int("AI_TIMEOUT_MS", 0),
   }),
 
+  /**
+   * Retrieval-augmented generation: embeddings and similarity search.
+   *
+   * ONE authoritative place for every value the RAG path depends on (§29). The
+   * model name in particular appears nowhere else in `src/` — not in the client,
+   * not in a repository, not in a prompt — because a second copy of it is how a
+   * corpus ends up with vectors from two different models in one column, which
+   * is silent, unrecoverable nonsense: cosine distance between them is a number,
+   * it is just not a distance.
+   */
+  rag: Object.freeze({
+    /**
+     * The embedding model. `gemini-embedding-001`, not `gemini-embedding-2`, and
+     * this is not a "newer is better" oversight.
+     *
+     * embedding-001 returns ONE VECTOR PER INPUT STRING. embedding-2, given a
+     * list of inputs, returns a SINGLE AGGREGATED embedding for the whole list.
+     * Batching chunks through embedding-2 would therefore store one vector
+     * describing the concatenation of every chunk — every row identical, every
+     * similarity score meaningless — and nothing about the response shape says
+     * so. A test asserting "results were returned" would pass.
+     *
+     * embedding-001 also supports the taskType enum, which embedding-2 dropped.
+     * That matters: documents are embedded as RETRIEVAL_DOCUMENT and questions
+     * as RETRIEVAL_QUERY, which is what makes an interrogative sentence land
+     * near the declarative passage that answers it instead of near other
+     * questions. See src/ai/embedding.service.js.
+     */
+    embeddingModel: process.env.STUDYPAL_EMBEDDING_MODEL || "gemini-embedding-001",
+
+    /**
+     * Output dimensionality, and the width of `material_chunks.embedding`.
+     *
+     * These two numbers MUST agree. They are checked against each other at
+     * startup — see configWarnings() — and asserted by
+     * tests/materials/embeddings.test.js, because a mismatch produces a
+     * PostgreSQL error on every single insert and nothing before that point
+     * would notice.
+     *
+     * 1536 rather than the model's native 3072 because pgvector's ANN indexes
+     * cap at 2000 dimensions, and the model is Matryoshka-trained so the
+     * truncation is supported (MTEB 68.2 → 68.17). Full reasoning in
+     * migrations/postgres/003_material_embeddings.sql.
+     *
+     * CHANGING THIS INVALIDATES EVERY STORED VECTOR. Not just the column width:
+     * a 1536-truncation and a 3072 vector describe different spaces, so they
+     * cannot be compared even after padding. It needs a migration and a
+     * re-index of every chunk, which is why it lives beside the model name.
+     */
+    embeddingDimensions: dimensions(
+      "STUDYPAL_EMBEDDING_DIM",
+      MIGRATED_EMBEDDING_DIMENSIONS,
+    ),
+    /**
+     * Chunks per embedContent request. Configurable per §10 because provider
+     * batch limits are a provider's business and may change without our
+     * releasing anything.
+     *
+     * 32 is conservative on purpose: a batch is all-or-nothing, so a large batch
+     * turns one transient failure into a lot of re-work, and the request body
+     * grows by ~1.8 KB per chunk.
+     */
+    embeddingBatchSize: int("STUDYPAL_EMBEDDING_BATCH_SIZE", 32),
+
+    /** Chunks retrieved per question, when the request does not ask for fewer. */
+    topK: int("STUDYPAL_RAG_TOP_K", 5),
+
+    /**
+     * The ceiling a request cannot exceed (§13). A client may ask for fewer
+     * chunks than `topK`; it may not ask for 10,000 and turn one question into a
+     * table scan plus a prompt the size of the corpus. Requests above this are
+     * clamped, not rejected — the parameter is a hint, not a contract.
+     */
+    maxTopK: int("STUDYPAL_RAG_MAX_TOP_K", 20),
+
+    /**
+     * Minimum cosine similarity for a chunk to count as evidence, where
+     * similarity = 1 - cosine_distance.
+     *
+     * 0.5 is a starting point, not a law, and §13 is explicit that no threshold
+     * is universally correct — it depends on the model, the chunk size and the
+     * subject matter. It is set low enough that a genuinely relevant passage
+     * phrased differently from the question still qualifies, and high enough
+     * that an unrelated question returns nothing rather than the least-unrelated
+     * chunk in the document. The consequence of "nothing" is an honest "your
+     * materials do not cover this", which is the correct answer to a question
+     * the materials do not cover.
+     */
+    similarityThreshold: ratio("STUDYPAL_RAG_SIMILARITY_THRESHOLD", 0.5),
+
+    /**
+     * Hard ceiling on retrieved characters placed in one prompt (§18).
+     *
+     * 12000 ≈ 6-7 chunks at the current 1800-char chunk size, so it binds only
+     * when topK is raised well above its default — it is a backstop against a
+     * pathological request, not a routine truncation. Characters rather than
+     * tokens: the tokenizer is the provider's, the budget has to be enforced
+     * before the request leaves, and a character count is exact where a token
+     * estimate is a guess. src/materials/context-builder.js drops whole chunks
+     * at the boundary rather than cutting one mid-sentence.
+     */
+    maxContextChars: int("STUDYPAL_RAG_MAX_CONTEXT_CHARS", 12_000),
+
+    /**
+     * Longest accepted question (§14). An enormous "question" is not a query —
+     * embedding models truncate their input anyway, so the tail would silently
+     * not participate in the search while still being billed for.
+     */
+    maxQuestionChars: int("STUDYPAL_RAG_MAX_QUESTION_CHARS", 2000),
+  }),
+
   limits: Object.freeze({
     /** Express default was 100kb; preserved so the 413 boundary is unchanged. */
     jsonBody: process.env.JSON_BODY_LIMIT || "100kb",
@@ -317,6 +483,29 @@ export function configWarnings() {
     warnings.push(
       "GEMINI_API_KEY is not set — POST /api/ask will fail with 500. " +
         "Other endpoints and GET /health are unaffected.",
+    );
+    warnings.push(
+      "GEMINI_API_KEY is not set — uploaded materials will be stored, extracted " +
+        "and chunked, but not embedded, so they stay indexing_status=failed and " +
+        "POST /api/materials/chat has nothing to retrieve.",
+    );
+  }
+
+  if (config.rag.embeddingDimensions !== MIGRATED_EMBEDDING_DIMENSIONS) {
+    warnings.push(
+      `STUDYPAL_EMBEDDING_DIM=${config.rag.embeddingDimensions} but ` +
+        `material_chunks.embedding was migrated as vector(${MIGRATED_EMBEDDING_DIMENSIONS}). ` +
+        "Every embedding insert will fail until a migration widens the column, and " +
+        "existing vectors are not comparable with the new ones — they need " +
+        "re-generating, not padding.",
+    );
+  }
+
+  if (config.rag.topK > config.rag.maxTopK) {
+    warnings.push(
+      `STUDYPAL_RAG_TOP_K=${config.rag.topK} exceeds STUDYPAL_RAG_MAX_TOP_K=` +
+        `${config.rag.maxTopK}, so the default retrieval size is clamped to the ` +
+        "maximum. Raise the maximum if the larger default is intended.",
     );
   }
 
