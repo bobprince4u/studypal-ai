@@ -11,6 +11,13 @@ Scope note: SP-V2-001 was instructed to fix only what could be addressed safely
 without expanding into a full security project. Several findings below are
 therefore recorded and deferred rather than fixed. Each says where it belongs.
 
+Later tickets kept this file current where their work touched a finding here —
+SP-V2-002 added §7, and SP-V2-004 revised S1, S7 and S8 — but each feature's own
+posture is documented with the feature: §12 of
+[`material-processing.md`](./material-processing.md) for uploads and storage, §8 of
+[`rag-architecture.md`](./rag-architecture.md) for embeddings, retrieval isolation
+and the prompt boundary.
+
 ---
 
 ## 1. Protections that already existed
@@ -91,9 +98,9 @@ Recorded deliberately, with the reason and where each belongs. Nothing here is
 
 | # | Deferred | Why, and where it belongs |
 | --- | --- | --- |
-| **S1** | **Authentication and authorization** | **The single largest gap in the product**, and explicitly out of scope for SP-V2-001. It is also not purely technical: it needs a product decision about what an account is for students who may share devices and have no reliable email. Until it exists, treat all stored study history as public to anyone who knows a username. Should be its own ticket, before any feature that stores something a student would mind others reading. |
-| **S7** | **Rate limiting** | Needs a dependency (`express-rate-limit` or equivalent) and two decisions this iteration cannot make: the limit itself, and whether a shared store is required behind more than one instance. **This is the highest-value deferred item** — it is the only finding with an unbounded financial cost, and it becomes urgent the moment the API is publicly reachable. Recommended for SP-V2-002. |
-| **S8** | **Prompt injection** | The student's text and the instructions share a turn. Fixing it properly means restructuring the prompt — separate system instruction, delimited user content — which **changes model output**, and this iteration's whole purpose was to change structure while holding behaviour fixed. Belongs with the RAG work, where untrusted retrieved text makes it materially worse. |
+| **S1** | **Authentication and authorization** | **The single largest gap in the product**, and explicitly out of scope for SP-V2-001. It is also not purely technical: it needs a product decision about what an account is for students who may share devices and have no reliable email. Until it exists, treat all stored study history as public to anyone who knows a username — and, since SP-V2-003 and SP-V2-004, their **uploaded documents and the ability to ask questions of them** as well. Ownership *is* enforced everywhere (every material query and the retrieval SQL carry `user_id`, and cross-user access returns `404`); what is unverified is only which user you are. Should be its own ticket, before any feature that stores something a student would mind others reading. |
+| **S7** | **Rate limiting** | Needs a dependency (`express-rate-limit` or equivalent) and two decisions this iteration cannot make: the limit itself, and whether a shared store is required behind more than one instance. **This is the highest-value deferred item** — it is the only finding with an unbounded financial cost, and it becomes urgent the moment the API is publicly reachable. SP-V2-004 raised the cost per request: `POST /api/materials/chat` is an embedding call plus a generation call, and `POST /api/materials` is one embedding call per chunk of an accepted 10 MB document. Recommended for SP-V2-002 and still not done. |
+| **S8** | **Prompt injection** — *partially addressed by SP-V2-004, still open* | The finding was: the student's text and the instructions share a turn. That is **still exactly true of `POST /api/ask`**, which SP-V2-004 did not touch. What changed is that the *new* endpoint was built the other way from the start: `POST /api/materials/chat` sends three labelled regions (application instructions, then the user's question, then retrieved material as numbered sources), never constructs its system instructions from document content, tells the model in writing to treat retrieved text as untrusted data and ignore instructions found inside it, and constrains the model's output to `{answer, sourceIndexes}` so an injected passage cannot manufacture a citation even if it changes the prose. `tests/materials/rag.test.js` asserts the boundary against a fixture chunk containing "Ignore all previous instructions…". **What is deliberately not claimed is resistance**: this is an architectural boundary and an explicit instruction, not a proof, and a persuasive enough injected passage can still influence an answer. Closing S8 for `/api/ask` still means restructuring that prompt, which still changes its output. See §5 of [`rag-architecture.md`](./rag-architecture.md). |
 | **S15** | **Reflected filename** | Left as-is because the only consumer escapes it (P7) and normalising stored filenames would alter existing `/api/history` responses. Worth handling if a non-React consumer is ever added. |
 | — | **`helmet`** | Deliberately not added. This is a JSON API with no HTML responses and no cookies, so most of what helmet sets is inert here and the meaningful headers are already set by hand. It becomes the right answer the moment the service serves anything browser-rendered. |
 | — | **AI request timeout** | Wired and configurable (`AI_TIMEOUT_MS`) but **defaults to 0 = off**, matching the previous behaviour. A generation has no upper bound today, so a stalled provider connection holds a socket indefinitely. Turning it on is a one-variable change; it is off by default only so this refactor cannot be blamed for a newly-failing slow request. Should be enabled with a measured value. |
@@ -106,24 +113,30 @@ Recorded deliberately, with the reason and where each belongs. Nothing here is
 
 ## 5. Recommended order for the next iteration
 
-1. **Rate limit `POST /api/ask`** (S7) — unbounded cost, cheapest fix, no product decision needed. Still not done; SP-V2-002 was a data-layer ticket.
-2. **Authentication** (S1) — largest gap; blocks anything privacy-sensitive. The `users` table SP-V2-002 created is where it attaches.
-3. **Enable `AI_TIMEOUT_MS`** with a measured value.
-4. **Prompt injection** (S8) — pair it with the RAG work, which makes it worse.
+1. **Rate limit `POST /api/ask` and `POST /api/materials/chat`** (S7) — unbounded cost, cheapest fix, no product decision needed. Still not done; SP-V2-002 was a data-layer ticket, SP-V2-003 and SP-V2-004 were feature tickets. It got **more** valuable in SP-V2-004: a chat request now costs an embedding call *and* a generation call, and an upload costs one embedding call per chunk.
+2. **Authentication** (S1) — largest gap; blocks anything privacy-sensitive. The `users` table SP-V2-002 created is where it attaches. Also more valuable than it was: SP-V2-003 and SP-V2-004 mean a username now unlocks someone's uploaded documents and the ability to ask questions of them, not just their question history.
+3. **Enable `AI_TIMEOUT_MS`** with a measured value. Now covering two provider calls rather than one.
+4. **Prompt injection on `/api/ask`** (S8) — the material-chat endpoint was built with the boundary in place; `/api/ask` still has the student's text and the instructions in one turn. See the S8 row above.
 
 ## 6. Re-running the checks
 
 ```bash
 cd studypal-backend
 npm audit                 # expect 0 vulnerabilities
-npm run db:up             # the suite needs a real PostgreSQL
-npm test                  # 99 tests: 35 contract + 26 hardening + 12 migrations + 26 schema
+npm run db:up             # the suite needs a real PostgreSQL with pgvector
+npm test                  # 423 tests in 86 suites
 npm run test:baseline     # 35 — the subset that also passes pre-refactor
 
 cd ../studypal-frontend
 npm audit                 # expect 0 vulnerabilities
 npx next build
 ```
+
+The `npm test` count grew from 99 at SP-V2-002 to 423: SP-V2-003 added the material
+suites and SP-V2-004 added four more (`embeddings`, `retrieval`, `chat`, `rag`). The
+security-relevant ones to look at first are the user-isolation tests in
+`tests/materials/retrieval.test.js` and `tests/materials/api.test.js`, and the
+injection-boundary tests in `tests/materials/rag.test.js`.
 
 ---
 

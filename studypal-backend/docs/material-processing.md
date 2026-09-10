@@ -3,10 +3,16 @@
 > **Status.** Added by **SP-V2-003**. This describes document *ingestion*: upload,
 > validation, storage, text extraction, normalization, chunking and persistence.
 >
-> **Embeddings, pgvector, semantic search and RAG are intentionally deferred to
-> SP-V2-004.** Nothing in this pipeline calls Gemini or any other model —
-> processing is deterministic parsing, not interpretation. §15 of this document
-> describes where the next iteration attaches.
+> **Nothing in this pipeline calls Gemini or any other model** — processing is
+> deterministic parsing, not interpretation, and that is what keeps its 54 tests
+> fast and its failures reproducible.
+>
+> **SP-V2-004 has since shipped embeddings, pgvector and retrieval**, and it did
+> so *beside* this pipeline rather than inside it: indexing is a second step the
+> upload orchestrator runs after processing returns. So everything below still
+> describes the code as it runs today. §15 records exactly where the seam ended up
+> and how it differs from what this document originally predicted;
+> [`rag-architecture.md`](./rag-architecture.md) documents the other side of it.
 
 The pipeline, end to end:
 
@@ -17,19 +23,27 @@ POST /api/materials
    ├─ 2. resolve user  username → users.id (created on demand)
    ├─ 3. store         bytes → <storage root>/<generated key>
    ├─ 4. insert row    materials, status = 'uploaded'
-   └─ 5. process       status = 'processing'
-            ├─ read      the one read of the file
-            ├─ extract   PDF → per-page text; TXT → one NULL-numbered page
-            ├─ normalize deterministic whitespace/control-character cleanup
-            ├─ gate      no meaningful text ⇒ 'failed', never an empty 'ready'
-            ├─ chunk     1800 characters, 250 overlap, 0-based, ordered
-            └─ persist   chunks + status = 'ready', in ONE transaction
+   ├─ 5. process       status = 'processing'
+   │        ├─ read      the one read of the file
+   │        ├─ extract   PDF → per-page text; TXT → one NULL-numbered page
+   │        ├─ normalize deterministic whitespace/control-character cleanup
+   │        ├─ gate      no meaningful text ⇒ 'failed', never an empty 'ready'
+   │        ├─ chunk     1800 characters, 250 overlap, 0-based, ordered
+   │        └─ persist   chunks + status = 'ready', in ONE transaction
+   │
+   └─ 6. index        SP-V2-004, and everything above is unchanged by it
+            embed every chunk → indexing_status = 'indexed'   (see §15)
 ```
 
-Everything is **synchronous**: the POST returns after processing has finished, so
-the response already carries the final `status` and `chunkCount`. §30 is explicit
-that no queue, worker or job table belongs in this iteration, and at a 10 MB cap
-the honest cost is a slower upload response rather than a lost document.
+Everything is **synchronous**: the POST returns after processing *and* indexing
+have finished, so the response already carries the final `status`, `chunkCount`
+and `indexingStatus`. §30 is explicit that no queue, worker or job table belongs
+in this iteration, and at a 10 MB cap the honest cost is a slower upload response
+rather than a lost document. Step 6 makes that response slower still — it is a
+network call to Google — but it cannot make the upload fail: indexing never
+throws, so a stored, extracted, chunked document returns `201` even when the
+embedding provider is unreachable, and reports the problem in `indexingStatus`
+instead of discarding the work.
 
 ---
 
@@ -135,6 +149,15 @@ Four invariants hold, and each is enforced by something stronger than review:
    a row still in `uploaded`. If it matches nothing the material was deleted, or
    something else is already processing it, and that throws rather than being
    recorded as a document failure.
+
+**This lifecycle is unchanged by SP-V2-004.** Indexing has its own column with its
+own four states, running in parallel rather than extending this diagram — see §9
+for the two-question table and §3 of
+[`database-architecture.md`](./database-architecture.md) for the columns. The one
+interaction worth knowing here: rebuilding a material's chunks resets
+`indexing_status` to `pending`, because vectors computed from replaced text are not
+valid for it (§8 of the RAG ticket — "if the chunk content changes, its old
+embedding must not remain valid").
 
 **An empty document never becomes `ready`** (§17). Three separate gates:
 
@@ -348,8 +371,10 @@ with a migration question attached, not a deployment knob.
 definition beginning 40 characters before the cut leaves one chunk ending
 mid-sentence and the next starting mid-sentence, and neither answers a question
 about it. Overlapping means every span of ~250 characters appears whole in at
-least one chunk. The cost is ~13% duplicated text — cheap storage now, cheap
-embedding later.
+least one chunk. The cost is ~13% duplicated text — and, now that SP-V2-004
+embeds every chunk, ~13% more vectors to generate and store. Both are cheap at
+this scale, and the alternative is retrieval that cannot answer a question whose
+answer straddles a cut.
 
 The *measured* shared text between consecutive chunks is a character or two under
 250 (248–249 in practice), because the next chunk's start is also snapped to a
@@ -467,6 +492,7 @@ SP-V2-001 central handler.
   "fileSize": 184320,
   "status": "ready",
   "pageCount": 12,
+  "indexingStatus": "indexed",
   "chunkCount": 27,
   "createdAt": "2026-09-06T10:15:00.000Z",
   "updatedAt": "2026-09-06T10:15:02.412Z"
@@ -479,8 +505,34 @@ present but empty reads like a bug in a client checking for its existence.
 `pageCount` is the opposite: always present, `null` when the format has no pages
 or the parser could not say.
 
-`/status` is a strict subset — `{id, status, pageCount, chunkCount}` plus `error`
-— rather than a different shape, so nothing new has to be learned to read it.
+**`indexingStatus` was added by SP-V2-004** and is always present — one of
+`pending`, `indexing`, `indexed`, `failed`. It is a *second, orthogonal* lifecycle,
+not a widening of `status`:
+
+| | asks | set by |
+| --- | --- | --- |
+| `status` | can this document be **read**? | extraction and chunking |
+| `indexingStatus` | can it be **searched**? | embedding |
+
+`status: "ready"` therefore kept exactly the meaning SP-V2-003 gave it — a value
+already in the database and already in a live contract does not get quietly
+redefined — and a material can be perfectly readable while not yet searchable. A
+failed *indexing* attempt adds `indexingError`, a separate key from `error` for the
+same reason the statuses are separate: a material can have either failure or both,
+and one key would make "readable but not searchable" indistinguishable from
+"unreadable". Both messages are sanitised, naming no provider, model or quota
+(§32 of the RAG ticket).
+
+`/status` is a strict subset — `{id, status, pageCount, chunkCount,
+indexingStatus}` plus `error` and `indexingError` — rather than a different shape,
+so nothing new has to be learned to read it. `indexingStatus` is on it
+*specifically* because this is the endpoint a client polls: "can I ask questions
+about this document yet?" is the question polling answers, and `status: "ready"`
+stopped being a complete answer to it.
+
+Retrieval and the chat endpoint that consumes these vectors are documented in
+[`rag-architecture.md`](./rag-architecture.md), not here — this document ends where
+the chunks are stored.
 
 **Three things are absent by construction, not by remembering to delete them**
 (§18, §21): `storage_key` (the repository's public column list does not select
@@ -536,6 +588,13 @@ Read through `src/config/env.js`, which remains the only reader of `process.env`
 The limit is defined **once** and used by both the multer limit and the validator
 (§9: "Do not duplicate hard-coded limits across the application"). Chunk size and
 overlap are deliberately **not** environment variables — see §7.
+
+SP-V2-004's variables (`STUDYPAL_EMBEDDING_MODEL`, `STUDYPAL_EMBEDDING_DIM`,
+`STUDYPAL_EMBEDDING_BATCH_SIZE`, `STUDYPAL_RAG_TOP_K`, `STUDYPAL_RAG_MAX_TOP_K`,
+`STUDYPAL_RAG_SIMILARITY_THRESHOLD`, `STUDYPAL_RAG_MAX_CONTEXT_CHARS`,
+`STUDYPAL_RAG_MAX_QUESTION_CHARS`) are read through the same file and documented in
+[`rag-architecture.md`](./rag-architecture.md) §2 and §4. None of them affects
+anything in this document: nothing here embeds, and nothing here retrieves.
 
 Multer uses `memoryStorage()`: the file arrives as a Buffer and multer never
 writes to disk. `DiskStorage` would create a temp file this code would then have
@@ -602,13 +661,13 @@ serialising every response body and searching it.
 | # | Limitation | Consequence |
 | --- | --- | --- |
 | 1 | **No authentication** (S1) | A username is an unverified claim. See §11. The single most important thing to fix before real use. |
-| 2 | **Processing is synchronous** | A large PDF holds the HTTP request for a second or two. Deliberate (§30); the seam for a queue is `processMaterial`'s signature. |
-| 3 | **No rate limiting** | An unauthenticated caller can upload repeatedly. Same posture as `/api/ask` (S7). |
+| 2 | **Processing is synchronous** | A large PDF holds the HTTP request for a second or two. Deliberate (§30); the seam for a queue is `processMaterial`'s signature. Since SP-V2-004 the upload also **indexes** synchronously, which is the slower half and the only part that makes a network call — see §15. |
+| 3 | **No rate limiting** | An unauthenticated caller can upload repeatedly. Same posture as `/api/ask` (S7), and now with a per-upload provider cost attached: every accepted document is an embedding bill. |
 | 4 | **Deleting a user orphans files** | The FK cascade reaches chunks, not the filesystem. There is no user-deletion endpoint today, so nothing triggers it. |
 | 5 | **A failed unlink leaks bytes** | `DELETE` returns success and logs the leak, rather than turning a completed delete into a 500. No client can see the file. |
 | 6 | **No deduplication** | The same document uploaded twice is stored twice, with two key sets and two chunk sets. Content addressing is a later decision. |
 | 7 | **Storage is node-local** | PostgreSQL no longer restricts instance count, but the storage directory does: two instances without shared storage each see only their own uploads, and an ephemeral filesystem loses every material on redeploy while its `materials` row still says `ready`. Deploying more than one instance needs a shared volume until §15's object-storage move happens. |
-| 8 | **No re-processing endpoint** | A `failed` material cannot be retried; the student deletes and re-uploads. `markProcessing`'s compare-and-set is what a retry path would build on. |
+| 8 | **No re-processing endpoint** | A `failed` material cannot be retried; the student deletes and re-uploads. `markProcessing`'s compare-and-set is what a retry path would build on. Re-*indexing* is one step better off — `reindexMaterial` exists and is callable — but it too has no endpoint, which is the whole of what §30 asked for. |
 | 9 | **Scanned PDFs are refused** | No OCR. The failure message says so explicitly rather than leaving the student to guess. |
 | 10 | **camelCase here, snake_case on the older endpoints** | Two conventions in one API. Fixing it means changing a frozen contract (§19). See §9. |
 | 11 | **`/api/ask` cannot parse PDFs** | **Pre-existing bug, not introduced here.** `src/services/upload.service.js` calls pdf-parse's 1.x API — `(await import("pdf-parse")).default` — which is `undefined` under 2.4.5, so every PDF sent to `/api/ask` falls back to "[A PDF was uploaded but could not be parsed.]". Fixing it would change that endpoint's answers, which §19 forbids in this ticket, so it needs its own change with its own test. `document-extractor.js` uses the 2.x API correctly. |
@@ -628,10 +687,17 @@ node --test tests/materials/                      # this feature only
 | `tests/materials/schema.test.js` | The migration, both tables, FKs, the UNIQUE constraint, the index list, every CHECK, cascade deletion — through SQL, so what is asserted is that the **database** refuses a bad row |
 | `tests/materials/processing.test.js` | `validateUpload`, `extractDocument`, `normalizeText`, `hasMeaningfulText`, `chunkText`, `chunkPages` — as pure functions, including determinism, measured overlap, and termination |
 | `tests/materials/api.test.js` | All five endpoints over real HTTP against real PostgreSQL: happy paths, every rejection, ownership isolation between two users, empty-document failures, deletion removing chunks **and** the stored file |
-| `tests/materials/architecture.test.js` | §27 as tests — SQL confined to the repository, `fs` confined to the storage service and two startup-time readers, no Gemini import under `src/materials`, no deferred infrastructure in `src/` or `package.json`. Every rule is paired with a counter-assertion that its pattern still matches something, because a grep-based check fails by matching nothing and staying green |
+| `tests/materials/architecture.test.js` | §27 as tests — SQL confined to the repository, `fs` confined to the storage service and two startup-time readers, the AI SDK reachable only through `src/ai/gemini.client.js`, no excluded infrastructure in `src/` or `package.json`. Every rule is paired with a counter-assertion that its pattern still matches something, because a grep-based check fails by matching nothing and staying green |
+
+SP-V2-004 added four more suites — `embeddings`, `retrieval`, `chat` and `rag` —
+and extended `schema`, `api` and `architecture` rather than replacing them. Their
+coverage is described in §9 of [`rag-architecture.md`](./rag-architecture.md). The
+`processing` suite is **unchanged**, which is the point of §15: 54 tests over pure
+functions, no fake, no network, no database.
 
 PostgreSQL is **real** in every test; Gemini is faked by a `node --import`
-preload; storage is a temporary directory per spawned server. Fixtures
+preload (which since SP-V2-004 intercepts the embedding endpoint too); storage is a
+temporary directory per spawned server. Fixtures
 ([`tests/fixtures/materials.mjs`](../tests/fixtures/materials.mjs),
 [`make-pdf.mjs`](../tests/fixtures/make-pdf.mjs)) are small, generated,
 deterministic and clearly test data — no real documents, and the PDFs are written
@@ -639,32 +705,54 @@ byte by byte rather than committed as binaries.
 
 ---
 
-## 15. Where SP-V2-004 attaches
+## 15. Where SP-V2-004 attached
 
-**Embeddings and pgvector are intentionally deferred to SP-V2-004.** The schema is
-shaped so that ticket adds to it rather than restructures it.
+This section used to be a prediction. SP-V2-004 has since been built, so it is now
+a record of which parts of the prediction held — which is the more useful thing for
+the next iteration to read, because it says what this schema is actually good at
+absorbing.
 
-### RAG and embeddings
+### RAG and embeddings — built
 
-`material_chunks` already has the stable identity an embedding needs — `(material_id,
-chunk_index)` — plus the `content` an embedding is computed from and the
-`page_number` a citation needs. So the next iteration is:
+The prediction was five steps. Four happened close to as written:
 
-1. `CREATE EXTENSION vector;`
-2. `ALTER TABLE material_chunks ADD COLUMN embedding vector(n);` — a nullable add,
-   which rewrites no rows
-3. An HNSW or IVFFlat index on that column
-4. A backfill for existing chunks, and an embed step after
-   `saveChunksAndMarkReady`
-5. A retrieval service, and a material-scoped chat endpoint
+| Predicted | What shipped |
+| --- | --- |
+| `CREATE EXTENSION vector;` | Yes, in `migrations/postgres/003_material_embeddings.sql`. |
+| `ALTER TABLE material_chunks ADD COLUMN embedding vector(n);`, nullable, rewriting no rows | Yes, with `n = 1536`. Still nullable, and permanently so: NULL is how "this chunk is not searchable yet" is represented, and retrieval's `WHERE embedding IS NOT NULL` is what makes a partially indexed material safe to query. |
+| An HNSW or IVFFlat index on that column | **No — deliberately not.** The one prediction that was wrong. Exact search has perfect recall, and the per-user filter already reduces each query to a small candidate set; an ANN index is searched *before* that filter, so at this scale it can be both slower to maintain and less accurate. §3 of [`database-architecture.md`](./database-architecture.md) records the decision and §4 of [`rag-architecture.md`](./rag-architecture.md) records the trigger for revisiting it. |
+| A backfill for existing chunks, and an embed step after `saveChunksAndMarkReady` | Both, but not in that shape. There is no backfill *migration*: `indexMaterial` reads only chunks whose embedding is NULL, so it is idempotent and resumable, and running it over old materials **is** the backfill (`reindexMaterial` is the same thing after a clear). And the embed step is **not** inside `processMaterial` after `saveChunksAndMarkReady` — see below. |
+| A retrieval service, and a material-scoped chat endpoint | Yes: `retrieval.service.js`, `retrieval.repository.js` and `POST /api/materials/chat`. |
 
-Nothing in this iteration has to move for that. What is deliberately **not** here
-is any of it: no vector column, no `tsvector`, no summary column, no embedding
-call, no retrieval endpoint, and no `pgvector` dependency —
-`tests/materials/architecture.test.js` asserts their absence by grep so an
-accidental early start fails a test.
+**The one architectural correction.** Putting the embed call after
+`saveChunksAndMarkReady`, inside `processMaterial`, would have been the smaller
+diff and it was the wrong place, for two independent reasons:
 
-### Object storage
+- It would have destroyed this pipeline's defining property. Processing is
+  deterministic, offline, credential-free parsing — that is why its 54 tests are
+  fast and why its failures are always reproducible. A provider call in the middle
+  of it makes every one of those tests need a network fake.
+- `saveChunksAndMarkReady` runs **inside a transaction**, and §41 forbids holding
+  a database connection open across a Gemini call. `DB_POOL_MAX` is 10.
+
+So indexing became `material-indexing.service.js`, a sibling that the orchestrator
+calls *after* processing returns: read what needs embedding (connection taken and
+released) → call the provider (no connection held) → write vectors and status in
+one transaction. **Not one file of the extraction pipeline changed.**
+`material-processing.service.js`, `document-extractor.js`, `text-normalizer.js`,
+`text-chunker.js` and `file-validation.js` are byte-for-byte what SP-V2-003 left,
+and this document describes them accurately for that reason.
+
+What did change, and is worth knowing when reading the rest of this document:
+`material.service.js` gained step 6 and `indexingStatus` in its API shape;
+`material.repository.js` selects the two new columns and resets
+`indexing_status` when a material's chunks are rebuilt; `material.routes.js` gained
+the chat route; `material-validation.middleware.js` gained `validateChatBody`.
+`tests/materials/architecture.test.js` no longer asserts pgvector's *absence* — it
+now asserts the layering that replaced it, which is the same kind of check pointed
+the other way.
+
+### Object storage — still deferred
 
 The seam is `local-storage.service.js`'s four functions, not a plugin system.
 Moving to S3 or GCS means:
@@ -674,11 +762,15 @@ Moving to S3 or GCS means:
    opaque generated identifier that is valid as an object key, and no path exists
    anywhere above that module.
 
+Still true after SP-V2-004: retrieval never touches the filesystem. It answers
+from `material_chunks.content` and the vector column, so a chat request reads no
+file at all and moving storage would not affect it.
+
 What would then need deciding, and is not decided here: signed URLs for direct
 download, whether `storage_key` gains a bucket prefix, and lifecycle rules for
 orphans (limitations 4 and 5 above).
 
-### Asynchronous processing
+### Asynchronous processing — still deferred
 
 `processMaterial({materialId, storageKey, mimeType})` takes an id and returns the
 finished row, so a queue **enqueues a call to it** rather than reimplementing it.
@@ -687,3 +779,12 @@ is already a compare-and-set, so two workers cannot both claim the same material
 The one client-visible change would be that `POST /api/materials` returns
 `uploaded` rather than a terminal state — which is exactly why
 `GET /api/materials/:id/status` exists now.
+
+`indexMaterial({materialId})` was built to the same shape for the same reason, and
+it is the step with the stronger case for moving off the request: it is the only
+part of an upload that makes a network call, so it is the only part whose duration
+an operator cannot bound. `markIndexing` is a compare-and-set exactly like
+`markProcessing`, and `GET /api/materials/:id/status` already returns
+`indexingStatus`, so the client-side polling a background indexer would need
+already exists. What is missing is only the queue itself — which §30 excludes from
+this iteration.
