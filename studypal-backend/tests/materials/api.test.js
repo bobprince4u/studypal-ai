@@ -142,12 +142,26 @@ describe("POST /api/materials", () => {
       "fileSize",
       "filename",
       "id",
+      // SP-V2-004. The only key this ticket added to the upload response, and it
+      // is asserted exactly rather than loosely so that a future ticket leaking
+      // `storageKey` or `userId` still fails here.
+      "indexingStatus",
       "mimeType",
       "pageCount",
       "status",
       "updatedAt",
     ]);
     assert.equal(material.status, "ready");
+    // Indexed synchronously during the upload, so a client that gets a 201 can
+    // ask questions immediately. `indexed` rather than `pending` is the assertion
+    // that matters: it proves the upload path actually reaches the embedding
+    // provider, and it is the value every retrieval test downstream depends on.
+    assert.equal(material.indexingStatus, "indexed");
+    assert.equal(
+      material.indexingError,
+      undefined,
+      "a successfully indexed material must carry no error key",
+    );
     assert.equal(material.filename, SHORT_TXT.filename);
     assert.equal(material.mimeType, "text/plain");
     assert.equal(material.fileSize, Buffer.byteLength(SHORT_TXT.content));
@@ -448,7 +462,7 @@ describe("GET /api/materials/:id", () => {
     assertNoInternals(res.body);
   });
 
-  it("reports status, page count and chunk count", async () => {
+  it("reports status, page count, chunk count and the indexing state", async () => {
     const username = testUser("status");
     const created = await uploadOk(username, multiPagePdf());
 
@@ -457,12 +471,52 @@ describe("GET /api/materials/:id", () => {
       `/api/materials/${created.id}/status?username=${username}`,
     );
     assert.equal(res.status, 200);
+    // Still an exact shape. `indexingStatus` joined it in SP-V2-004 because this
+    // is the endpoint a client POLLS, and the question it polls to answer — "can I
+    // ask questions about this document yet?" — stopped being answerable from
+    // `status` alone once readable and searchable became two lifecycles (§7).
     assert.deepEqual(res.body, {
       id: created.id,
       status: "ready",
       pageCount: 3,
       chunkCount: created.chunkCount,
+      indexingStatus: "indexed",
     });
+  });
+
+  it("reports an unsearchable material as ready but not indexed", async () => {
+    // §7 and §9 together: an embedding outage must not make a perfectly readable
+    // document look broken, and must not make it look searchable either. A
+    // separate server, because the mode is fixed for a process's lifetime.
+    const offline = await startServer({
+      label: "matnoembed",
+      env: { FAKE_EMBEDDING_MODE: "http-error" },
+    });
+    try {
+      const username = testUser("noembed");
+      const created = await offline.request("POST", "/api/materials", {
+        form: materialForm({ username, file: SHORT_TXT }),
+      });
+
+      assert.equal(created.status, 201, created.text);
+      assert.equal(created.body.status, "ready", "the document is still readable");
+      assert.equal(created.body.indexingStatus, "failed");
+      assert.equal(
+        typeof created.body.indexingError,
+        "string",
+        "a failed indexing run must say so",
+      );
+      assert.equal(created.body.chunkCount, 1, "the chunks were kept, not discarded");
+      assertNoInternals(created.body);
+
+      const status = await offline.request(
+        "GET",
+        `/api/materials/${created.body.id}/status?username=${username}`,
+      );
+      assert.equal(status.body.indexingStatus, "failed");
+    } finally {
+      await offline.stop();
+    }
   });
 
   it("includes a safe error in the status of a failed material", async () => {
