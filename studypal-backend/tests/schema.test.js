@@ -440,9 +440,10 @@ describe("scope", () => {
     const { rows } = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
     );
-    // material_chunks and materials joined this list in SP-V2-003, which is the
-    // only reason they are here: the assertion is still exact, so the next
-    // ticket that adds a table has to come back and say so.
+    // material_chunks and materials joined this list in SP-V2-003, and
+    // study_plans/study_plan_tasks in SP-V2-005, which is the only reason any of
+    // them are here: the assertion is still exact, so the next ticket that adds
+    // a table has to come back and say so.
     assert.deepEqual(
       rows.map((r) => r.tablename),
       [
@@ -450,20 +451,22 @@ describe("scope", () => {
         "materials",
         "questions",
         "schema_migrations",
+        "study_plan_tasks",
+        "study_plans",
         "users",
       ],
-      "the data foundation plus SP-V2-003's materials — no other feature tables yet",
+      "the data foundation, SP-V2-003's materials and SP-V2-005's study plans — no other feature tables yet",
     );
   });
 
   it("has not created the tables reserved for later tickets", async () => {
     // Named explicitly so a premature `CREATE TABLE exams` fails here rather
     // than shipping an empty table nothing reads. `materials` and
-    // `material_chunks` were on this list until SP-V2-003 created them, and are
-    // now asserted above instead.
+    // `material_chunks` were on this list until SP-V2-003 created them;
+    // `study_plans` and `study_plan_tasks` until SP-V2-005 did. All four are
+    // asserted above instead — they move rather than being deleted, so the list
+    // of what is still deferred stays honest.
     const reserved = [
-      "study_plans",
-      "study_plan_tasks",
       "exams",
       "exam_questions",
       "exam_attempts",

@@ -768,19 +768,40 @@ describe("§45, §46 no deferred infrastructure crept in", () => {
 });
 
 describe("§19 /api/ask is untouched by the material pipeline", () => {
-  it("nothing in the question path imports a material module", async () => {
+  it("only the two modules allowed to may import a material module", async () => {
     // The direction of the dependency is the whole of §19's protection. Materials
     // may not reach into /api/ask's behaviour, and /api/ask must not start
     // depending on materials — "do not make /api/ask depend on material IDs yet".
+    //
+    // The specifier pattern tolerates a DOT in the basename. It did not until
+    // SP-V2-005, and `[a-z-]+` cannot match `material.repository.js` or
+    // `retrieval.service.js` — so for two tickets this rule could only have
+    // caught an import of the one hyphenated module, `context-builder.js`, and
+    // silently permitted every other. Widening it is what turns the list below
+    // from an exemption for one filename into a real allowlist.
     const files = (await jsFiles(SRC)).filter(
       (file) => !file.startsWith("src/materials/") && !file.startsWith("src/storage/"),
     );
-    const offenders = Object.entries(await readAll(files))
-      .filter(([, source]) => /["'][^"']*materials\/[a-z-]+\.js["']/.test(source))
+    const importers = Object.entries(await readAll(files))
+      .filter(([, source]) =>
+        /["'][^"']*materials\/[a-z.-]+\.js["']/.test(stripComments(source)),
+      )
+      .map(([file]) => file);
+
+    // Exact rather than empty, and self-anchoring in both directions: a new
+    // importer fails here, and so does either of these two ceasing to import,
+    // which would mean the reuse SP-V2-005 §15 requires had been replaced by a
+    // second copy of retrieval.
+    assert.deepEqual(importers, [
       // The route table must mount the router; that is how the feature is reachable.
-      .map(([file]) => file)
-      .filter((file) => !/routes\.js$|app\.js$/.test(file));
-    assert.deepEqual(offenders, [], `§19: ${offenders.join(", ")} must not depend on materials`);
+      "src/routes/index.js",
+      // SP-V2-005 §15: "do not turn the study-plan generator into a second RAG
+      // implementation. Reuse: embedding provider, retrieval service, context
+      // builder." This is the single module that does, and
+      // tests/study-plans/architecture.test.js states what it may reach for and
+      // asserts that no vector search of its own accompanies it.
+      "src/study-plans/material-brief.js",
+    ]);
   });
 
   it("keeps its own upload middleware and extension logic", async () => {

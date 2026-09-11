@@ -907,6 +907,14 @@ describe("indexes", () => {
     );
     assert.deepEqual(rows.map((r) => r.indexname), [
       "idx_materials_user_created",
+      // Added by 004_study_plans.sql, not by this feature. It is the index
+      // behind `UNIQUE (id, user_id)`, which exists solely to be the target of
+      // study_plan_tasks' composite foreign key — that is what lets the database
+      // itself refuse a task pointing at another user's material, rather than
+      // trusting application code to check. It appears here because this
+      // assertion is exact on purpose: a later migration touching `materials`
+      // has to come back to this line and say why.
+      "materials_id_user_key",
       "materials_pkey",
       "materials_storage_key_key",
     ]);

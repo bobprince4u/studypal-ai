@@ -58,20 +58,28 @@ removed from `package.json`, and the old schema is kept unexecuted at
 
 ## 2. Schema overview
 
-Four application tables plus the migration runner's bookkeeping. `users` and
+Six application tables plus the migration runner's bookkeeping. `users` and
 `questions` came from SP-V2-002; `materials` and `material_chunks` were added by
-SP-V2-003.
+SP-V2-003; `study_plans` and `study_plan_tasks` by SP-V2-005.
 
 ```
 users
   ├── questions               one row per question asked      (SP-V2-002)
-  └── materials               one row per uploaded document   (SP-V2-003)
-        └── material_chunks   one row per text chunk, ordered (SP-V2-003)
+  ├── materials               one row per uploaded document   (SP-V2-003)
+  │     └── material_chunks   one row per text chunk, ordered (SP-V2-003)
+  └── study_plans             one row per generated plan      (SP-V2-005)
+        └── study_plan_tasks  one row per scheduled session   (SP-V2-005)
+                └╌╌╌╌╌╌╌╌╌╌╌ may cite one material, optionally, and only
+                             ever one belonging to the same user
 ```
 
-Everything hangs off `users.id`, and **every foreign key is `ON DELETE
-CASCADE`** — deleting a user removes their questions, their materials and those
-materials' chunks, in one statement.
+Everything hangs off `users.id`, and **every foreign key that expresses
+ownership is `ON DELETE CASCADE`** — deleting a user removes their questions,
+their materials, those materials' chunks, their study plans and those plans'
+tasks, in one statement. The two references added by `004` that are *not*
+ownership — a task's optional `material_id`, and a plan's optional
+`parent_plan_id` — are `ON DELETE SET NULL`, because losing the thing referred
+to does not invalidate the row referring to it.
 
 ```
 ┌─────────────────────────────────────┐
@@ -130,6 +138,48 @@ materials' chunks, in one statement.
 │ created_at   TIMESTAMPTZ  NOT NULL          │
 └─────────────────────────────────────────────┘
 
+┌─────────────────────────────────────────────┐
+│ study_plans                                 │
+├─────────────────────────────────────────────┤
+│ id              BIGINT      PK identity     │◄──┐ ∪ also (id, user_id)
+│ user_id         BIGINT      NOT NULL     FK │ → users (id), CASCADE
+│ title           TEXT        NOT NULL        │   │
+│ subject         TEXT        NOT NULL        │   │
+│ goal            TEXT        NOT NULL        │   │
+│ start_date      DATE        NOT NULL        │   │ first scheduled task
+│ end_date        DATE        NOT NULL        │   │ last scheduled task
+│ exam_date       DATE        NOT NULL        │   │ ≥ end_date
+│ daily_minutes   INTEGER     NOT NULL        │   │ 1…1440
+│ difficulty_level TEXT       NOT NULL        │   │ beginner|intermediate|advanced
+│ status          TEXT        NOT NULL        │   │ = 'active'
+│ topics          TEXT[]      NOT NULL        │   │ = '{}'
+│ study_days      TEXT[]      NOT NULL        │   │ 1-7 lowercase weekdays
+│ material_ids    BIGINT[]    NOT NULL        │   │ = '{}'  request record, not FK
+│ parent_plan_id  BIGINT      NULL         FK │ ──┘ SET NULL. The plan this one
+│ created_at      TIMESTAMPTZ NOT NULL        │     regenerated from
+│ updated_at      TIMESTAMPTZ NOT NULL        │
+└─────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────┐
+│ study_plan_tasks                            │
+├─────────────────────────────────────────────┤
+│ id             BIGINT      PK identity      │
+│ study_plan_id  BIGINT      NOT NULL      FK ╗ (study_plan_id, user_id)
+│ user_id        BIGINT      NOT NULL         ╝ → study_plans (id, user_id), CASCADE
+│ scheduled_date DATE        NOT NULL       ∪ │ ∪ = (study_plan_id,
+│ position       INTEGER     NOT NULL       ∪ │      scheduled_date, position)
+│ title          TEXT        NOT NULL         │
+│ description    TEXT        NULL             │
+│ topic          TEXT        NULL             │
+│ task_type      TEXT        NOT NULL         │ study|review|practice|recap
+│ duration_minutes INTEGER   NOT NULL         │ 1…1440
+│ status         TEXT        NOT NULL         │ = 'pending'
+│ material_id    BIGINT      NULL          FK ╗ (material_id, user_id)
+│                                             ╝ → materials (id, user_id),
+│ created_at     TIMESTAMPTZ NOT NULL         │   SET NULL (material_id)
+│ updated_at     TIMESTAMPTZ NOT NULL         │
+└─────────────────────────────────────────────┘
+
 ┌─────────────────────────────────────┐
 │ schema_migrations   (bookkeeping)   │
 ├─────────────────────────────────────┤
@@ -142,13 +192,13 @@ materials' chunks, in one statement.
 ∪ = UNIQUE
 ```
 
-**Relationships:** one user has many questions and many materials; one material
-has many chunks. `ON DELETE CASCADE` throughout means deleting a user deletes
-their questions, materials and chunks — chosen so the first data-deletion request
-is a `DELETE` rather than a migration. The one thing the cascade cannot reach is
-the filesystem: deleting a user through SQL orphans their uploaded bytes on disk.
-Nothing does that today, and it is recorded as a limitation in §9 rather than
-worked around with a trigger.
+**Relationships:** one user has many questions, many materials and many study
+plans; one material has many chunks; one plan has many tasks. `ON DELETE
+CASCADE` on every path back to `users` means deleting a user deletes all of it —
+chosen so the first data-deletion request is a `DELETE` rather than a migration.
+The one thing the cascade cannot reach is the filesystem: deleting a user through
+SQL orphans their uploaded bytes on disk. Nothing does that today, and it is
+recorded as a limitation in §9 rather than worked around with a trigger.
 
 **Embeddings live in `material_chunks.embedding`**, added by migration `003` as
 002 predicted: a nullable `ALTER TABLE … ADD COLUMN embedding vector(1536)` that
@@ -171,9 +221,10 @@ candidate rows. The full reasoning, the trigger for revisiting it, and the one
 
 The full DDL, with a comment on every non-obvious decision, is
 [`migrations/postgres/001_core_schema.sql`](../migrations/postgres/001_core_schema.sql),
-[`migrations/postgres/002_materials.sql`](../migrations/postgres/002_materials.sql)
+[`migrations/postgres/002_materials.sql`](../migrations/postgres/002_materials.sql),
+[`migrations/postgres/003_material_embeddings.sql`](../migrations/postgres/003_material_embeddings.sql)
 and
-[`migrations/postgres/003_material_embeddings.sql`](../migrations/postgres/003_material_embeddings.sql).
+[`migrations/postgres/004_study_plans.sql`](../migrations/postgres/004_study_plans.sql).
 Those files are the source of truth; this section describes them.
 
 ### `users` replaces `sessions`
@@ -250,6 +301,57 @@ avoids writing it.
 it, and a plain indexed column beats a JSONB expression for the one field that is
 queried rather than merely displayed.
 
+### `study_plans` and `study_plan_tasks`
+
+Added by SP-V2-005. The domain that writes them — validation, scheduling,
+generation, normalization — is documented in
+[`study-plan-architecture.md`](./study-plan-architecture.md); what follows is
+only the part that is a schema decision.
+
+- **`study_plan_tasks.user_id` is denormalised, and nothing reads it.** A task's
+  owner is derivable by joining to its plan. The column exists so two foreign
+  keys can be composite — `(study_plan_id, user_id) → study_plans (id, user_id)`
+  and `(material_id, user_id) → materials (id, user_id)` — which makes **a task
+  citing another learner's material unrepresentable** rather than merely
+  prevented by a check in the service layer. That is also why `004` adds
+  `materials_id_user_key UNIQUE (id, user_id)` to a table it otherwise does not
+  touch: a composite FK needs a composite key to point at. The cost is one
+  redundant `BIGINT` per task, which the column's `COMMENT` admits.
+- **`material_ids BIGINT[]` is a record of the request, not a live reference.**
+  The ids are re-resolved against `materials` with the owner in the `WHERE`
+  clause every time they are used, so a material deleted afterwards simply
+  resolves to nothing. An array of foreign keys is not something PostgreSQL can
+  enforce anyway, and a join table would imply a currency the column does not
+  have.
+- **`ON DELETE SET NULL (material_id)`**, not cascade. Deleting a material nulls
+  the citation and leaves the task intact — a study session does not stop being
+  one because the PDF behind it was removed, and cascading would silently delete
+  work a learner had already completed.
+- **`parent_plan_id` rather than a `version` column.** Regeneration inserts a new
+  plan pointing at the old one and archives the old one; it never mutates a row
+  a learner may have worked through. `study_plans_parent_not_self` forbids the
+  one-row cycle; the reference is `ON DELETE SET NULL` so deleting an ancestor
+  does not take its descendants with it.
+- **`UNIQUE (study_plan_id, scheduled_date, position)`** because order within a
+  day is part of the data, exactly as `(material_id, chunk_index)` is for
+  chunks. It also *is* the index §51 asks for on `(study_plan_id,
+  scheduled_date)`, so no second index was created.
+- **`end_date >= start_date` and `end_date <= exam_date` are CHECK
+  constraints**, not service-layer assertions. A plan that ends after the exam it
+  prepares for is meaningless, and the constraint holds for any writer, including
+  a future one.
+- **`study_days` is constrained to the seven lowercase weekday names** by
+  `study_days <@ ARRAY['monday', …]` plus a cardinality check of 1–7. The
+  application lowercases and deduplicates before writing; the constraint means a
+  writer that forgets cannot produce a plan whose schedule cannot be interpreted.
+- **Status values are CHECK constraints, not enums**, following the convention
+  001 set. `cancelled` is accepted and nothing writes it — a deliberate seam, not
+  an oversight.
+
+`tests/study-plans/schema.test.js` asserts each of these through SQL — including
+that the database itself rejects a task whose `material_id` belongs to another
+user, which is the whole reason the composite key exists.
+
 ### Types, and why the API did not change
 
 | Decision | Reason |
@@ -257,6 +359,7 @@ queried rather than merely displayed.
 | `BIGINT GENERATED ALWAYS AS IDENTITY` | The SQL-standard spelling. `ALWAYS` stops an INSERT supplying its own id, which would leave the sequence behind the table. `BIGINT` because widening a PK later means rewriting every referencing row. |
 | No UUIDs | Nothing here needs a client-generated or globally-unique id. A UUID PK would cost index size and locality for a property no requirement asks for. |
 | `TIMESTAMPTZ`, not `TIMESTAMP` | An instant, not a wall-clock reading. The pool pins the session to UTC so the same row renders identically on every machine. |
+| `DATE` for everything a study plan schedules | A calendar day, not an instant. "Monday the 14th" does not move when a learner travels, and a `TIMESTAMPTZ` would make it depend on the reader's offset. `pg-types` keeps these as raw `YYYY-MM-DD` strings for the same reason. |
 | `BOOLEAN has_file` | Was `INTEGER` 0/1, which is why the old service wrapped every read in `Boolean()`. The column now has the right type and the conversion is gone. |
 | `TEXT`, never `VARCHAR(n)` | Identical performance in PostgreSQL; a length limit belongs in validation, where the error message can be useful. `MAX_USERNAME_LENGTH` is enforced there. |
 
@@ -273,7 +376,7 @@ shapes.
 
 ## 3. Indexes
 
-Four indexes exist beyond what the PK and UNIQUE constraints create, and each
+Six indexes exist beyond what the PK and UNIQUE constraints create, and each
 one serves a query in the code today. No speculative indexes: every index costs
 write throughput and disk, and an unused one is pure loss.
 
@@ -282,6 +385,8 @@ write throughput and disk, and an unused one is pure loss.
 | `idx_questions_user_created (user_id, created_at DESC)` | `GET /api/history/:username` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 30` | Equality column first, then the sort column. PostgreSQL finds the user's rows and walks them already in order, so the `LIMIT` stops after 30 with no sort step. This is the index SP-V2-001 deferred (A9). |
 | `idx_questions_user_topic (user_id, topic)` | `GET /api/progress/:username` — `WHERE user_id = $1 GROUP BY topic ORDER BY count DESC LIMIT 6` | Including `topic` lets the grouping read the index rather than fetching every matching row. A second index on the same leading column is only worth it because progress is called on every page load alongside history. |
 | `idx_materials_user_created (user_id, created_at DESC)` | `GET /api/materials?username=…` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2` | Same shape and same reasoning as the history index, and the only material query no PK or UNIQUE constraint already covers. This is §29's "index material ownership". |
+| `idx_study_plans_user_created (user_id, created_at DESC)` | `GET /api/study-plans?username=…` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC` | The third instance of the same shape, for the third list-my-own-rows endpoint. This is §51's "index `user_id`". |
+| `idx_study_plan_tasks_material (material_id, user_id) WHERE material_id IS NOT NULL` | The referential check behind `DELETE /api/materials/:id` — PostgreSQL must find tasks pointing at the material being deleted | **Partial.** Most tasks cite no material (§7: not every task has one), and a NULL row has nothing to find, so the predicate keeps the index proportional to the grounded tasks rather than to all of them. Without it, every material deletion sequentially scans every task in the database. Column order matches the foreign key's own. |
 | `users_username_key` (from the UNIQUE constraint) | Every endpoint — each resolves a username to a `user_id` first | Also the constraint `POST /api/session` relies on via `ON CONFLICT (username)`. |
 
 `material_chunks` gets **no added index**. Its `UNIQUE (material_id,
@@ -290,6 +395,16 @@ the ordered read (`WHERE material_id = $1 ORDER BY chunk_index`) and the
 chunk-count aggregate — so §29's "index chunk ordering" is satisfied by a
 constraint that had to exist anyway. Adding a second index on `material_id` alone
 would duplicate that one's leading column for no gain.
+
+**`study_plan_tasks` gets nothing for the read that matters either**, for the
+same reason. `UNIQUE (study_plan_id, scheduled_date, position)` is exactly the
+index SP-V2-005 §51 asks for on `(study_plan_id, scheduled_date)`, and it serves
+both the ordered read of a plan's tasks and the per-day grouping the normalizer's
+output is checked against. The per-plan ownership check — `WHERE id = $1 AND
+user_id = $2`, the only way a plan is ever fetched — is served by
+`study_plans_id_user_key`, which had to exist anyway as the composite foreign
+key's target. Two constraints that were required for correctness happen to be the
+two indexes the query plan wants, so `004` creates only the two above.
 
 **And no index on `material_chunks.embedding`.** pgvector's HNSW and IVFFlat are
 *approximate*: they trade recall for speed. Retrieval here answers a student's
@@ -305,13 +420,14 @@ records the trigger for revisiting it and the single `CREATE INDEX … USING hns
 index either — the one query filtering on it is already scoped by primary key, and
 a single-column index on a four-value column would never be chosen.
 
-`tests/schema.test.js` asserts the exact index list on `questions`, and
-`tests/materials/schema.test.js` does the same for both material tables, so
-adding one fails a test and prompts a justification. Both suites also run
-`EXPLAIN` against the queries these indexes exist for, at a few thousand rows,
-and assert the planner actually uses them — an index PostgreSQL declines to use is
-the same as no index, and at fixture scale a sequential scan genuinely is cheaper,
-so the tests build enough rows to reach the regime the index exists for.
+`tests/schema.test.js` asserts the exact index list on `questions`,
+`tests/materials/schema.test.js` does the same for both material tables, and
+`tests/study-plans/schema.test.js` for both plan tables, so adding one fails a
+test and prompts a justification. All three suites also run `EXPLAIN` against the
+queries these indexes exist for, at a few thousand rows, and assert the planner
+actually uses them — an index PostgreSQL declines to use is the same as no index,
+and at fixture scale a sequential scan genuinely is cheaper, so the tests build
+enough rows to reach the regime the index exists for.
 
 ---
 
@@ -547,17 +663,27 @@ name that none of the reserved tables exist, so creating one early fails a test.
 
 | Feature | Expected shape | Attaches to |
 | --- | --- | --- |
-| Study plans | `study_plans`, `study_plan_tasks` | `study_plans.user_id → users.id` |
 | Exams and attempts | `exams`, `exam_questions`, `exam_attempts`, `attempt_answers` | `exams.user_id → users.id` |
 | Learning analytics | `learning_events` | `learning_events.user_id → users.id` |
 | Real accounts | `password_hash`, `email_verified_at` on `users`; a `sessions` table that actually holds sessions | The nullable columns already on `users` |
 | Multi-turn material chat | `conversations`, `conversation_messages` | `conversations.user_id → users.id`; each question is independent today |
 
-Two rows have left this table by being built. SP-V2-003 created `materials` and
-`material_chunks`, and **SP-V2-004 added semantic search over them** — the
-`vector` extension, `material_chunks.embedding` as `vector(1536)`, and the
-`indexing_status` lifecycle, all in migration `003`. Both now live in §2, and
-[`rag-architecture.md`](./rag-architecture.md) documents the retrieval path.
+Three rows have left this table by being built. SP-V2-003 created `materials` and
+`material_chunks`; **SP-V2-004 added semantic search over them** — the `vector`
+extension, `material_chunks.embedding` as `vector(1536)`, and the
+`indexing_status` lifecycle, all in migration `003`; and **SP-V2-005 created
+`study_plans` and `study_plan_tasks`** in migration `004`. All now live in §2,
+and [`rag-architecture.md`](./rag-architecture.md) and
+[`study-plan-architecture.md`](./study-plan-architecture.md) document the
+features built on them.
+
+The study-plan tables landed with one shape this table did not predict:
+`study_plan_tasks` attaches to `study_plans` through a **composite** foreign key
+carrying `user_id`, not through `study_plan_id` alone. The prediction
+`study_plans.user_id → users.id` was right and is what the plan table does; the
+task table needed more, because a task can also cite a material, and only a
+composite key can make "cite *someone else's* material" impossible rather than
+merely checked. §2 covers the reasoning.
 
 What `003` deliberately did **not** create is an ANN index on the vector column:
 exact search has perfect recall, the per-user filter keeps each query small, and
@@ -590,3 +716,8 @@ new numbered file in `migrations/postgres/`; the existing ones are immutable.
 | 12 | The embedding dimension is baked into the DDL as `vector(1536)` | `STUDYPAL_EMBEDDING_DIM` is validated against it at startup only as a **warning**, not a refusal. Set them differently and uploads still succeed, extraction still succeeds, and every embedding write then fails at the column's type check — visible as `indexing_status = 'failed'`, not as a startup error. Changing the dimension for real is a new migration plus a full re-index, never a config edit. |
 | 13 | **A vector is bigger than the text it indexes.** 1536 four-byte floats is ~6 KB per chunk against ~1.8 KB of content | Indexing roughly quadruples what a material costs on disk. Acceptable at a 10 MB upload cap and one of the three reasons the dimension is 1536 rather than the model's native 3072; a much larger corpus would want a smaller dimension or the vectors in their own table. |
 | 14 | **Nothing detects a mixed embedding space.** Vectors written under one model and a query embedded under another are still comparable *to PostgreSQL* | `<=>` returns a number for any two vectors of equal width, so the failure mode is not an error but confident nonsense in the ranking. No column records which model produced a row. The remedy is `reindexMaterial` run deliberately after any model change, which is why that consequence is documented in three places rather than left to be discovered. |
+| 15 | **`study_plans.material_ids` can dangle.** It is a `BIGINT[]`, so no foreign key constrains it and deleting a material leaves its id in the array of every plan that named it | Harmless by construction — the ids are re-resolved against `materials` with the owner in the `WHERE` clause on every use, so a deleted one resolves to nothing. But the column is a record of the request, not a live reference, and anything that reads it as a live reference will be wrong. §2 covers why it is not a join table. |
+| 16 | **"Today" is the server's UTC today**, and study plans are `DATE` columns | A learner in UTC+13 asking for a plan at 10am on the 15th gets one starting on the 14th, because that is still the date in UTC. The alternative — trusting a client-supplied date — is worse, since it lets a caller schedule into the past. A real fix is a per-user timezone on `users`, which is a product decision no requirement has asked for yet. |
+| 17 | **Archived plans accumulate.** Every regeneration inserts a new plan and archives the old one; nothing prunes the chain | Deliberate — the old plan holds task progress a learner may have made, and §30 is explicit that regeneration must not overwrite. But a learner who regenerates twenty times has twenty rows, all returned by `GET /api/study-plans`, which has no status filter. Same family as limitation 6: fine at current scale, a retention decision later. |
+| 18 | **`GET /api/study-plans` is capped, not paginated** | It reuses the material list ceiling and returns the newest N with no cursor, so a learner past that count cannot reach their oldest plans through the API. The cap exists to bound the response; pagination is the thing that was not built, and the same is true of the other two list endpoints. |
+| 19 | **`updated_at` on both new tables is maintained by the repository, not by a trigger** | Every `UPDATE` sets it explicitly. Identical exposure to limitations 4 and 9: a future writer that forgets leaves it stale, and nothing catches that. The consistent fix across all four tables is one trigger function, which is a migration nobody has needed badly enough yet. |

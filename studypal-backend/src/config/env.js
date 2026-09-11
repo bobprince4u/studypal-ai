@@ -113,6 +113,19 @@ function dimensions(name, fallback) {
  */
 const MIGRATED_EMBEDDING_DIMENSIONS = 1536;
 
+/**
+ * The ceilings migrations/postgres/004_study_plans.sql actually enforces.
+ *
+ * Same purpose as MIGRATED_EMBEDDING_DIMENSIONS above: this module's one piece
+ * of schema knowledge, held so that a configuration which the database would
+ * reject is reported at startup rather than as a constraint violation on the
+ * first plan anyone tries to create. A CHECK failure surfaces as a 500 from
+ * inside the persistence layer, where it reads as a bug in the code rather than
+ * as a number someone set too high.
+ */
+const PLAN_DB_MAX_DAILY_MINUTES = 1440;
+const PLAN_DB_MAX_TEXT_CHARS = 200;
+
 const nodeEnv = process.env.NODE_ENV || "development";
 
 // ── storage directory ─────────────────────────────────────────────────────────
@@ -428,6 +441,105 @@ export const config = Object.freeze({
     maxQuestionChars: int("STUDYPAL_RAG_MAX_QUESTION_CHARS", 2000),
   }),
 
+  /**
+   * AI-generated study plans (SP-V2-005).
+   *
+   * Every number the study-plan path uses to accept or refuse a request lives
+   * here, for the reason §48 gives: the alternative is the same literal written
+   * into a validator, a normalizer and a test, where changing it means finding
+   * all three. What is NOT here is anything the model decides — there is no
+   * knob for how many tasks a day should have or how long one should be,
+   * because those are pedagogical judgements the generator makes within these
+   * bounds, not settings.
+   *
+   * Retrieval settings are deliberately absent too. A material-grounded plan
+   * uses config.rag.topK and config.rag.similarityThreshold unchanged, because
+   * §15 is explicit that this feature must reuse the existing retrieval service
+   * rather than grow a second one — and a second set of tuning knobs is how a
+   * second implementation starts.
+   */
+  plan: Object.freeze({
+    /**
+     * Topics one request may name (§10). 20 is well past any real exam syllabus
+     * at this granularity, and the point of the limit is the prompt: every topic
+     * is a line the model must plan around, and a request with 500 of them is
+     * not a study plan, it is a way to make one HTTP call cost a lot of tokens.
+     */
+    maxTopics: int("STUDYPAL_PLAN_MAX_TOPICS", 20),
+
+    /**
+     * Longest accepted subject, and longest accepted single topic.
+     *
+     * Matches the study_plans_subject_bounded and study_plan_tasks_topic_bounded
+     * CHECK constraints in migrations/postgres/004_study_plans.sql — the same
+     * arrangement as materialFilenameLength: validation rejects an over-long
+     * value with a message that says which field, and the constraint catches a
+     * code path that skipped validation. Changing this alone makes the API
+     * accept something the database then refuses with a 500.
+     */
+    maxTextChars: int("STUDYPAL_PLAN_MAX_TEXT_CHARS", 200),
+
+    /**
+     * The daily study budget the API will accept, in minutes (§10).
+     *
+     * The minimum exists because a plan is built by packing tasks into daily
+     * budgets, and a budget below the shortest sensible study session produces
+     * either zero tasks or a schedule of two-minute fragments. The maximum is
+     * policy, not physics: the CHECK constraint's ceiling is 1440 because that
+     * is how many minutes a day has, whereas 720 is a statement that twelve
+     * hours of daily revision is past the point where more schedule helps.
+     *
+     * §10's examples land on either side of these on purpose: -100 and 0 fail
+     * int()'s positivity check, 999999 fails this maximum.
+     */
+    minDailyMinutes: int("STUDYPAL_PLAN_MIN_DAILY_MINUTES", 10),
+    maxDailyMinutes: int("STUDYPAL_PLAN_MAX_DAILY_MINUTES", 720),
+
+    /**
+     * Materials one plan may be grounded in. Each one costs an ownership check,
+     * a retrieval round trip and a share of the context budget, so this bounds
+     * the work a single POST can commission — not just the size of an array.
+     */
+    maxMaterials: int("STUDYPAL_PLAN_MAX_MATERIALS", 10),
+
+    /**
+     * How far ahead an exam date may be, in days (§10's "compatible with the
+     * start date").
+     *
+     * Without a ceiling, an exam date in 2124 asks the scheduler to enumerate
+     * every study date for a century — tens of thousands of dates, built and
+     * sorted before a single task exists. A year is longer than any exam anyone
+     * plans daily revision for, and the failure it prevents is quiet: the
+     * request succeeds, slowly, and produces a plan with a five-figure gap in
+     * the middle.
+     */
+    maxHorizonDays: int("STUDYPAL_PLAN_MAX_HORIZON_DAYS", 365),
+
+    /**
+     * Tasks one plan may contain (§51's "cap the number of tasks").
+     *
+     * Applied to the model's output, not to the request, and it is the reason a
+     * plan cannot become an unbounded INSERT: the validator refuses a response
+     * with more than this many tasks rather than trimming it, because a plan
+     * that was designed as 400 tasks and persisted as its first 200 is a
+     * different plan than the one the model reasoned about.
+     */
+    maxTasks: int("STUDYPAL_PLAN_MAX_TASKS", 200),
+
+    /**
+     * Characters of retrieved material context placed in one planning prompt.
+     *
+     * Half of config.rag.maxContextChars, and lower for a reason rather than by
+     * accident. A chat answer is grounded in the passage it quotes, so more
+     * context is more evidence; a study plan needs only enough of each material
+     * to know what it covers, and the rest of the prompt — the learner's goals,
+     * the instructions, the response schema — is what should be steering the
+     * output. §14 is explicit that whole documents must never be sent, and this
+     * is the number that makes that structural.
+     */
+    maxContextChars: int("STUDYPAL_PLAN_MAX_CONTEXT_CHARS", 6000),
+  }),
+
   limits: Object.freeze({
     /** Express default was 100kb; preserved so the 413 boundary is unchanged. */
     jsonBody: process.env.JSON_BODY_LIMIT || "100kb",
@@ -506,6 +618,33 @@ export function configWarnings() {
       `STUDYPAL_RAG_TOP_K=${config.rag.topK} exceeds STUDYPAL_RAG_MAX_TOP_K=` +
         `${config.rag.maxTopK}, so the default retrieval size is clamped to the ` +
         "maximum. Raise the maximum if the larger default is intended.",
+    );
+  }
+
+  if (config.plan.minDailyMinutes > config.plan.maxDailyMinutes) {
+    warnings.push(
+      `STUDYPAL_PLAN_MIN_DAILY_MINUTES=${config.plan.minDailyMinutes} exceeds ` +
+        `STUDYPAL_PLAN_MAX_DAILY_MINUTES=${config.plan.maxDailyMinutes}, so no ` +
+        "value of dailyMinutes can satisfy both and POST /api/study-plans will " +
+        "reject every request with a 400.",
+    );
+  }
+
+  if (config.plan.maxDailyMinutes > PLAN_DB_MAX_DAILY_MINUTES) {
+    warnings.push(
+      `STUDYPAL_PLAN_MAX_DAILY_MINUTES=${config.plan.maxDailyMinutes} is above the ` +
+        `study_plans_daily_minutes_bounded CHECK (${PLAN_DB_MAX_DAILY_MINUTES}, the ` +
+        "number of minutes in a day). Validation would accept a value the database " +
+        "then refuses, turning a 400 into a 500.",
+    );
+  }
+
+  if (config.plan.maxTextChars > PLAN_DB_MAX_TEXT_CHARS) {
+    warnings.push(
+      `STUDYPAL_PLAN_MAX_TEXT_CHARS=${config.plan.maxTextChars} is above the ` +
+        `study_plans_subject_bounded CHECK (${PLAN_DB_MAX_TEXT_CHARS}). An accepted ` +
+        "subject or topic longer than that fails on INSERT, after Gemini has " +
+        "already been called and paid for.",
     );
   }
 
