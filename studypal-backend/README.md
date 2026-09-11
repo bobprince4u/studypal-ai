@@ -86,7 +86,7 @@ real environment variable beating both. Neither file is committed.
 | --- | --- | --- |
 | `DATABASE_URL` | — | **Required.** `postgresql://user:pass@host:port/db`. No fallback: the server will not start without it. |
 | `STUDYPAL_TEST_DATABASE_URL` | — | **Required for `npm test`**, ignored otherwise. Must have `test` in its name. `DATABASE_URL` is never used as a fallback here — see [Tests](#tests). |
-| `GEMINI_API_KEY` | — | Required for `POST /api/ask`, for embedding uploaded materials, and for `POST /api/materials/chat`. Every other endpoint works without it. |
+| `GEMINI_API_KEY` | — | Required for `POST /api/ask`, for embedding uploaded materials, for `POST /api/materials/chat`, and for generating study plans. Every other endpoint works without it. |
 | `PORT` | `4000` | Must be numeric; a non-numeric value fails at startup. |
 | `NODE_ENV` | `development` | `production` enables HSTS and drops the automatic localhost CORS allowance. |
 | `LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` \| `silent`. |
@@ -133,6 +133,26 @@ cannot be reconciled by padding. It needs a migration that clears `embedding` an
 a re-index of every chunk (`reindexMaterial`). The server warns at startup if
 `STUDYPAL_EMBEDDING_DIM` disagrees with the migrated column width.
 
+### Study plans
+
+The generator's bounds, all read in one place (`config.plan` in
+`src/config/env.js`) and explained in
+[`docs/study-plan-architecture.md`](./docs/study-plan-architecture.md) §12. Each
+is validated at startup against what the migration's CHECK constraints allow, so
+a value the database would reject fails before the first request rather than on
+it.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `STUDYPAL_PLAN_MAX_TOPICS` | `20` | Topics one request may name. |
+| `STUDYPAL_PLAN_MAX_TEXT_CHARS` | `200` | Longest subject, and longest single topic. |
+| `STUDYPAL_PLAN_MIN_DAILY_MINUTES` | `10` | Below this a plan is not schedulable; the request is rejected rather than producing one task a week. |
+| `STUDYPAL_PLAN_MAX_DAILY_MINUTES` | `720` | 12 hours. Also the ceiling a model-suggested duration is clamped to. |
+| `STUDYPAL_PLAN_MAX_MATERIALS` | `10` | Materials one plan may be grounded in. |
+| `STUDYPAL_PLAN_MAX_HORIZON_DAYS` | `365` | How far ahead an exam may be. |
+| `STUDYPAL_PLAN_MAX_TASKS` | `200` | Cap on tasks in one plan, which also caps the dates the scheduler generates. |
+| `STUDYPAL_PLAN_MAX_CONTEXT_CHARS` | `6000` | Budget for retrieved material in one planning prompt — half the chat budget, because a plan prompt also carries the learner's goals. |
+
 ### CORS
 
 With neither `FRONTEND_URL` nor `CORS_ORIGINS` set, the API accepts requests
@@ -162,6 +182,11 @@ allowed regardless, so configuring a deployment does not break local work.
 | `GET` | `/api/materials/:id/status` | `?username=` | `200 {id, status, indexingStatus, pageCount, chunkCount}` |
 | `DELETE` | `/api/materials/:id` | `?username=` | `200 {id, deleted: true}` |
 | `POST` | `/api/materials/chat` | JSON `{username, question, materialId?, topK?}` | `200 {answer, sources[]}` |
+| `POST` | `/api/study-plans` | JSON — subject, topics, exam date, daily minutes, level, study days, materials | `201` — the plan with its tasks |
+| `GET` | `/api/study-plans` | `?username=` | `200` — array, newest first, with task counts |
+| `GET` | `/api/study-plans/:id` | `?username=` | `200` — the plan with its tasks |
+| `PATCH` | `/api/study-plans/:planId/tasks/:taskId` | JSON `{username, status}` | `200` — the updated task |
+| `POST` | `/api/study-plans/:id/regenerate` | JSON `{username}` | `201` — a **new** plan, the old one archived |
 
 Errors are always JSON: `{"error": "<message>"}`.
 
@@ -176,8 +201,14 @@ there is no file. Uploads are accepted for `.pdf`, `.png`, `.jpg`, `.jpeg`,
 `.gif`, `.webp`, `.txt`, `.md`, `.csv`, `.json` and `.log`; anything else is
 `415`, and anything over the size limit is `413`.
 
-Full request/response detail for every endpoint, including each error case, is in
-[`docs/api-contract.md`](./docs/api-contract.md).
+Full request/response detail for the five original endpoints, including each
+error case, is in [`docs/api-contract.md`](./docs/api-contract.md) — that file is
+deliberately frozen at the contract it was written to protect. The endpoints each
+later feature added are documented with that feature:
+[`docs/material-processing.md`](./docs/material-processing.md) for uploads,
+[`docs/rag-architecture.md`](./docs/rag-architecture.md) for material chat, and
+[`docs/study-plan-architecture.md`](./docs/study-plan-architecture.md) §9 for
+study plans.
 
 ### Study materials
 
@@ -256,16 +287,68 @@ Architecture, the pgvector schema, the vector-index decision, the grounding rule
 and the deferred work are in
 [`docs/rag-architecture.md`](./docs/rag-architecture.md).
 
+### Study plans
+
+`POST /api/study-plans` turns a learner's goals into a dated, ordered schedule:
+
+```
+{username, subject, topics[], examDate, dailyMinutes, difficultyLevel,
+ studyDays[], materialIds[]}
+  → validate everything server-side  (bounds from config.plan)
+  → compute the available dates      (the learner's weekdays, today → exam, UTC)
+  → brief the model on their own materials, as MATERIAL_1…n
+  → Gemini                           (structured output: {title, goal, tasks[]})
+  → validate the output              (reject, never repair; at most one retry)
+  → normalize                        (clamp durations, pack into days, resolve
+                                      aliases to real material ids)
+  → one transaction                  (plan + tasks, opened after generation)
+→ 201 {id, title, subject, goal, startDate, endDate, dailyMinutes,
+       difficultyLevel, status, tasks[]}
+```
+
+**The backend owns every date.** The response schema gives the model no field in
+which to express one — not a validated field, none — so a task cannot land on an
+excluded Saturday or outside the exam window, because those dates are never
+generated. "Today" is the server's UTC today, never the client's clock.
+
+**The model never sees a database id.** Materials are resolved against the caller
+first, then passed to the prompt as `MATERIAL_1`, `MATERIAL_2`; the backend holds
+the map. An alias the model invents is dropped and the task kept — its judgement
+about what to study survives, its false claim about the source does not. The
+composite foreign key on `study_plan_tasks` means a task citing another learner's
+material is not merely rejected but unrepresentable.
+
+**Invalid model output persists nothing.** There is no partial plan to clean up,
+because the transaction opens only after generation has returned and validated.
+Two failures stay distinguishable: `AI_UNAVAILABLE` (the provider) and
+`AI_INVALID_OUTPUT` (the response), neither carrying a provider message.
+
+**Materials are optional.** A plan for a subject with nothing uploaded is the
+common case, not a degraded one: retrieval is skipped and the prompt carries no
+material section.
+
+Regeneration never overwrites. `POST /api/study-plans/:id/regenerate` inserts a
+new plan with `parent_plan_id` set and archives the original in the same
+transaction, so completed task progress survives. Plan `status` is derived from
+task state after every `PATCH`, in both directions — completing the last task
+completes the plan, reopening one reverts it.
+
+The schema, the scheduling rules, the prompt's security boundary, the two
+normalization choices (§21 clamping, §22 dropping the tail) and the deferred work
+are in
+[`docs/study-plan-architecture.md`](./docs/study-plan-architecture.md).
+
 ### Note on identity
 
 A "username" is an unverified string. There is no password, no token and no
 authorization check: anyone who knows or guesses a username can read that
-student's history, list, read and delete their uploaded materials, and now **ask
-questions of those materials and read passages of them back in the answer**.
-Material ownership *is* enforced — student A cannot reach student B's material by
-id, and retrieval's SQL constrains every search to one user — but nothing stops
-someone claiming to **be** student B. This is the pre-existing behaviour, kept
-deliberately for now — see
+student's history, list, read and delete their uploaded materials, ask questions
+of those materials and read passages of them back in the answer, and now **read
+and modify their study plans**. Ownership *is* enforced — student A cannot reach
+student B's material or plan by id, retrieval's SQL constrains every search to
+one user, and a task citing another user's material is rejected by the database
+itself — but nothing stops someone claiming to **be** student B. This is the
+pre-existing behaviour, kept deliberately for now — see
 [`docs/security-baseline.md`](./docs/security-baseline.md) (S1). Each iteration
 makes it matter more: this API is not fit for real student data until
 authentication exists.
@@ -273,7 +356,7 @@ authentication exists.
 ## Tests
 
 ```bash
-npm test              # 423 tests in 86 suites
+npm test              # 626 tests in 129 suites
 npm run test:baseline # 35 — the API-contract subset
 npm run characterize  # print observed behaviour across ~30 request variants
 ```
@@ -395,6 +478,38 @@ named `studypal_test_run_%` and cleared by `dropStaleTestDatabases()`.
   still matches something, because the way a grep-based check fails is by silently
   matching nothing.
 
+- **`tests/study-plans/schema.test.js`** (36) — `study_plans` and
+  `study_plan_tasks` through SQL: every column and CHECK constraint, the exact
+  index list, both query plans, cascade deletion from user and from plan, and the
+  composite foreign key proved by the database **refusing a task whose material
+  belongs to another user**.
+
+- **`tests/study-plans/scheduling.test.js`** (45) — the calendar and the
+  normalizer as pure functions, with no database, no provider and no fixtures:
+  excluded weekdays, month and year boundaries, leap days, the task cap, duration
+  clamping, daily packing, the dropped tail, and derived `startDate`/`endDate`.
+
+- **`tests/study-plans/api.test.js`** (65) — the five endpoints over real HTTP:
+  the creation contract, every validation rejection, ownership isolation between
+  two users (a real id and a fabricated one returning **byte-identical** 404s),
+  task status transitions in both directions, derived plan status, and
+  regeneration archiving its parent without touching completed progress.
+
+- **`tests/study-plans/generation.test.js`** (26) — what happens when the model
+  misbehaves: six kinds of malformed output, each asserted to leave **zero rows in
+  both tables**; the single bounded retry; invented material aliases dropped;
+  durations clamped; overflow dropped; upstream errors not leaking their status;
+  concurrent creates all committing; and a plan generated with embeddings broken,
+  proving the no-materials path is genuinely not the RAG path.
+
+- **`tests/study-plans/architecture.test.js`** (31) — the SP-V2-005 boundaries:
+  SQL confined to the plan repository, the provider reachable only from the
+  generator, the clock read in exactly one module, no second RAG implementation,
+  no provider call inside a transaction, ownership expressible only as
+  `findOwnedById`, and the prompt constant free of interpolation. It states what
+  is new rather than restating the tree-wide rules the materials suite already
+  covers, and carries the same counter-assertions.
+
 ## Architecture
 
 ```
@@ -415,6 +530,11 @@ src/
                    controllers, services, repositories, the deterministic document
                    modules (extractor, normalizer, chunker, validation), and the
                    RAG path (indexing, retrieval, context builder, source mapper)
+  study-plans/     the SP-V2-005 feature, self-contained: routes, controller,
+                   service, repository, generator, AI-output validator, and the
+                   deterministic domain (study-calendar, plan-normalizer,
+                   material-brief). Reuses src/materials/ retrieval; owns every
+                   date itself
   storage/         local-storage.service.js — the only module that touches the
                    filesystem: save, read, delete, exists, over generated keys
   middleware/      cors, validation, upload, security headers, error handler
@@ -430,23 +550,37 @@ Controllers contain no SQL and no provider calls; services never touch `req` or
 imported by `src/config/database.js`, `src/config/pg-types.js` and the test
 helpers, and by nothing else. `@google/genai` is imported by
 `src/ai/gemini.client.js` and nothing else — not by a repository, not by a
-controller, not by a retrieval module. `node:fs` is imported by exactly three
-modules: `src/storage/local-storage.service.js`, which is the storage abstraction
-itself, plus `src/db/migrator.js` (reads the migration files) and
-`src/utils/version.js` (reads `package.json` for `/health`) — both startup-time,
-neither on a request path. Nothing in `src/materials/` touches the filesystem
-directly, and the vector SQL lives in exactly one function in one repository.
-`tests/materials/architecture.test.js` asserts all of that by reading the source
-tree, so a layering rule cannot quietly stop being true while the tests stay
-green — and each rule is paired with an assertion that its pattern still matches
-something, so the check cannot go vacuous either.
+controller, not by a retrieval module, not by the plan generator. `node:fs` is
+imported by exactly three modules: `src/storage/local-storage.service.js`, which
+is the storage abstraction itself, plus `src/db/migrator.js` (reads the migration
+files) and `src/utils/version.js` (reads `package.json` for `/health`) — both
+startup-time, neither on a request path. Nothing in `src/materials/` or
+`src/study-plans/` touches the filesystem directly, and the vector SQL lives in
+exactly one function in one repository.
+
+Two feature folders reach across the tree, and only in one direction:
+`src/routes/index.js` mounts each feature's router, and
+`src/study-plans/material-brief.js` imports the retrieval service and context
+builder rather than growing a second copy of them. Both directories are stated as
+an exact allowlist, so a third importer fails a test — and so does either of
+those two ceasing to import, which would mean the reuse had been replaced by a
+duplicate.
+
+`tests/materials/architecture.test.js` and `tests/study-plans/architecture.test.js`
+assert all of that by reading the source tree, so a layering rule cannot quietly
+stop being true while the tests stay green — and each rule is paired with an
+assertion that its pattern still matches something, so the check cannot go
+vacuous either.
 
 [`docs/database-architecture.md`](./docs/database-architecture.md) covers the
 schema, the indexes and why each exists, the migration strategy, and connection
 management. [`docs/material-processing.md`](./docs/material-processing.md) covers
-document ingestion end to end, and
+document ingestion end to end,
 [`docs/rag-architecture.md`](./docs/rag-architecture.md) covers embeddings,
-pgvector retrieval, grounding and citation integrity.
+pgvector retrieval, grounding and citation integrity, and
+[`docs/study-plan-architecture.md`](./docs/study-plan-architecture.md) covers
+plan generation: backend-owned scheduling, the material alias boundary, the
+normalizer, and the regeneration design.
 [`docs/current-architecture.md`](./docs/current-architecture.md) describes both
 the pre-refactor system and the current one, and
 [`docs/security-baseline.md`](./docs/security-baseline.md) records what is fixed
@@ -480,10 +614,12 @@ and what is knowingly deferred.
   `docs/material-processing.md` §15 has the migration path.
 - **Set `FRONTEND_URL`** so CORS is not wide open.
 - **Rate limiting is not implemented.** `POST /api/ask` bills a Gemini call per
-  request, and `POST /api/materials/chat` bills an embedding call per request plus
-  a generation call per grounded answer — with no ceiling and no authentication.
-  Put a limit in front of both before exposing them publicly — see
-  `docs/security-baseline.md` (S7).
+  request, `POST /api/materials/chat` bills an embedding call per request plus a
+  generation call per grounded answer, and `POST /api/study-plans` bills one
+  embedding call per topic plus a generation call — with no ceiling and no
+  authentication. Plan creation is the most expensive endpoint in the API and the
+  one whose retry can bill twice, so put a limit in front of all three before
+  exposing them publicly — see `docs/security-baseline.md` (S7).
 - **A material uploaded without a working `GEMINI_API_KEY` is stored but not
   searchable.** It ends `ready` + `indexing_status='failed'`, and
   `reindexMaterial({materialId})` is the way to fix it once the key works. The
