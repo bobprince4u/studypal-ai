@@ -26,8 +26,8 @@
  * client, the real request construction and the real response parsing are all
  * exercised; only the network is fake.
  *
- * THREE INDEPENDENT MODE SWITCHES
- * -------------------------------
+ * FOUR INDEPENDENT MODE SWITCHES
+ * ------------------------------
  * One variable per failure surface, because a test needs to break one thing at a
  * time. `FAKE_GEMINI_MODE=http-error` used to be the only switch; if it also
  * governed embeddings, a test of "the AI is down" would additionally leave every
@@ -64,6 +64,32 @@
  *     "wrong-dimension"→ vectors of the wrong width
  *     "nan"            → a vector containing NaN
  *     "count-mismatch" → fewer vectors than inputs
+ *
+ *   FAKE_PLAN_MODE       generation for POST /api/study-plans (SP-V2-005),
+ *                        recognised by `durationMinutes` in its
+ *                        responseJsonSchema — the same technique the chat path
+ *                        uses, and for the same reason: one server process must
+ *                        be able to serve /api/ask, /api/materials/chat and
+ *                        /api/study-plans with the right shape for each.
+ *     "valid"         → a plan sized to the brief the prompt states  (default)
+ *     "long-tasks"    → every task exceeds the daily budget (§21 clamping)
+ *     "overflow"      → far more content than the calendar holds (§22 dropping)
+ *     "cite-material" → every task cites MATERIAL_1
+ *     "invent-material" → tasks cite MATERIAL_99, which no prompt contains (§20)
+ *     "prose"         → not JSON at all
+ *     "empty-tasks"   → a well-formed plan with zero tasks (§19)
+ *     "no-title"      → tasks present, plan title missing (§19)
+ *     "bad-type"      → a taskType outside the four allowed (§19)
+ *     "bad-duration"  → durationMinutes as the string "45 minutes" (§19)
+ *     "too-many-tasks"→ more tasks than STUDYPAL_PLAN_MAX_TASKS (§19)
+ *     "long-text"     → title and goal far over the column bounds (clamping)
+ *     "retry-once"    → invalid on the first call, valid on the second, which is
+ *                       the only way to observe §33's single controlled retry
+ *
+ *   FAKE_PLAN_MODE governs only the RESPONSE SHAPE, exactly like FAKE_CHAT_MODE:
+ *   a plan test that needs the provider itself to fail sets FAKE_GEMINI_MODE.
+ *   Setting FAKE_GEMINI_MODE=http-error and still receiving a 200 is what proves
+ *   an endpoint did NOT call the generation API.
  *
  * The vectors come from tests/fixtures/vectors.mjs, whose orthonormal-basis design
  * is what makes retrieval ordering predictable on paper (§35).
@@ -196,6 +222,188 @@ function chatBodyForMode(mode, requestBody) {
   }
 }
 
+/** The plan title the study-plan modes return, so a test can assert on it. */
+export const CANNED_PLAN_TITLE = "Focused Revision Plan";
+
+/**
+ * Is this generation call the study-plan one?
+ *
+ * Same technique as isMaterialChatRequest, and the marker is again a field name
+ * unique to one schema: `durationMinutes` appears in
+ * STUDY_PLAN_RESPONSE_SCHEMA and nowhere else. /api/ask sends no
+ * responseJsonSchema at all, and the chat schema names `sourceIndexes`, so the
+ * three generation paths are distinguishable without any test having to remember
+ * to set a flag.
+ */
+function isStudyPlanRequest(init) {
+  return typeof init?.body === "string" && init.body.includes("durationMinutes");
+}
+
+/**
+ * The brief the prompt states, read back out of it.
+ *
+ * The fake sizes its response to what it was actually asked for, rather than to
+ * constants that would silently stop matching when a test changes a learner's
+ * daily minutes. Both numbers are emitted by formatLearnerGoals in
+ * src/ai/prompts/study-plan.prompt.js.
+ *
+ * The fallbacks are deliberately small: a prompt that did not state a brief is a
+ * bug in the prompt, and a fake that quietly invented a large one would hide it.
+ */
+function planBrief(body) {
+  const text = promptText(body);
+  const minutes = Number(text.match(/Time available per study day: (\d+)/)?.[1]);
+  const sessions = Number(
+    text.match(/Number of study sessions available before the exam: (\d+)/)?.[1],
+  );
+  return {
+    dailyMinutes: Number.isInteger(minutes) && minutes > 0 ? minutes : 60,
+    sessionCount: Number.isInteger(sessions) && sessions > 0 ? sessions : 1,
+  };
+}
+
+/** Does the prompt carry an AVAILABLE MATERIALS block naming MATERIAL_1? */
+function promptHasMaterials(body) {
+  return promptText(body).includes("MATERIAL_1");
+}
+
+function planTask(index, { durationMinutes, material }) {
+  return {
+    title: `Session ${index + 1}: core concepts`,
+    description:
+      "Work through the key ideas, then summarise them in your own words.",
+    topic: "Photosynthesis",
+    // Cycled rather than fixed so a single plan exercises more than one branch
+    // of the task_type CHECK constraint.
+    taskType: ["study", "review", "practice", "recap"][index % 4],
+    durationMinutes,
+    ...(material ? { material } : {}),
+  };
+}
+
+/**
+ * How many calls this process has served, keyed by mode.
+ *
+ * Module-level state is safe here because each test starts its own server child
+ * process (see startServer), so the counter begins at zero for every test rather
+ * than leaking across them. "retry-once" is the only mode that reads it.
+ */
+const planCallCounts = new Map();
+
+function planBodyForMode(mode, requestBody) {
+  const { dailyMinutes, sessionCount } = planBrief(requestBody);
+  const material = promptHasMaterials(requestBody) ? "MATERIAL_1" : null;
+
+  // Two tasks per session day, each half the budget, so a valid plan exercises
+  // multi-task days and `position` ordering rather than only one task per date.
+  // Capped so a long horizon cannot push a happy-path plan past maxTasks — that
+  // is what "too-many-tasks" is for, and it should fail for that reason alone.
+  const perDay = 2;
+  const taskCount = Math.min(sessionCount * perDay, 100);
+  const duration = Math.max(1, Math.floor(dailyMinutes / perDay));
+
+  const valid = {
+    title: CANNED_PLAN_TITLE,
+    goal: "Build a working understanding of the subject before the exam.",
+    tasks: Array.from({ length: taskCount }, (_, i) =>
+      planTask(i, { durationMinutes: duration, material }),
+    ),
+  };
+
+  switch (mode) {
+    case "long-tasks":
+      // §21. Every task is one minute over the whole daily budget, so the
+      // normalizer must clamp each one and give each its own day.
+      return JSON.stringify({
+        ...valid,
+        tasks: Array.from({ length: taskCount }, (_, i) =>
+          planTask(i, { durationMinutes: dailyMinutes + 1, material }),
+        ),
+      });
+
+    case "overflow":
+      // §22. Ten times the content the calendar can hold, so the tail must be
+      // dropped rather than scheduled past the exam date.
+      return JSON.stringify({
+        ...valid,
+        tasks: Array.from({ length: Math.min(sessionCount * 10 + 10, 190) }, (_, i) =>
+          planTask(i, { durationMinutes: dailyMinutes, material }),
+        ),
+      });
+
+    case "cite-material":
+      return JSON.stringify({
+        ...valid,
+        tasks: valid.tasks.map((task) => ({ ...task, material: "MATERIAL_1" })),
+      });
+
+    case "invent-material":
+      // §20. An alias no prompt has ever contained. The reference must be
+      // dropped and the task kept.
+      return JSON.stringify({
+        ...valid,
+        tasks: valid.tasks.map((task) => ({ ...task, material: "MATERIAL_99" })),
+      });
+
+    case "prose":
+      return "Here is a lovely study plan, described in prose. No JSON at all.";
+
+    case "empty-tasks":
+      return JSON.stringify({ ...valid, tasks: [] });
+
+    case "no-title":
+      return JSON.stringify({ ...valid, title: "   " });
+
+    case "bad-type":
+      return JSON.stringify({
+        ...valid,
+        tasks: [{ ...valid.tasks[0], taskType: "exam" }],
+      });
+
+    case "bad-duration":
+      return JSON.stringify({
+        ...valid,
+        tasks: [{ ...valid.tasks[0], durationMinutes: "45 minutes" }],
+      });
+
+    case "too-many-tasks":
+      return JSON.stringify({
+        ...valid,
+        tasks: Array.from({ length: 500 }, (_, i) =>
+          planTask(i, { durationMinutes: 10, material: null }),
+        ),
+      });
+
+    case "long-text":
+      return JSON.stringify({
+        ...valid,
+        title: "T".repeat(600),
+        goal: "G".repeat(5000),
+        tasks: valid.tasks.map((task) => ({
+          ...task,
+          title: "S".repeat(600),
+          description: "D".repeat(5000),
+          topic: "P".repeat(600),
+        })),
+      });
+
+    case "retry-once": {
+      // §33. The first call is refused by the validator, the second succeeds —
+      // so a test can assert both that one retry happens and that it produces a
+      // single plan rather than two.
+      const seen = (planCallCounts.get("retry-once") ?? 0) + 1;
+      planCallCounts.set("retry-once", seen);
+      return seen === 1
+        ? "not json at all, on purpose"
+        : JSON.stringify(valid);
+    }
+
+    case "valid":
+    default:
+      return JSON.stringify(valid);
+  }
+}
+
 /**
  * The embeddings envelope for a `:batchEmbedContents` request.
  *
@@ -283,6 +491,15 @@ globalThis.fetch = async function patchedFetch(input, init) {
 
   if (mode === "http-error") {
     return upstreamError();
+  }
+
+  // Checked before the chat marker only for readability; the two markers are
+  // fields of different schemas and cannot both be present.
+  if (isStudyPlanRequest(init)) {
+    const planMode = process.env.FAKE_PLAN_MODE || "valid";
+    return jsonResponse(
+      geminiEnvelope(planBodyForMode(planMode, parseBody(init))),
+    );
   }
 
   if (isMaterialChatRequest(init)) {

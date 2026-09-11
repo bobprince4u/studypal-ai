@@ -107,6 +107,45 @@ export async function findOwnedById(id, userId) {
 }
 
 /**
+ * The subset of `ids` that belongs to this user, in the order given.
+ *
+ * The plural of findOwnedById, and it exists for the same reason that one takes
+ * a userId: SP-V2-005 resolves a study plan's `materialIds` here, and §10 is
+ * explicit that client-claimed material ownership is not to be trusted. Passing
+ * the whole list to one query rather than looping findOwnedById is §51's "avoid
+ * N+1" — a plan scoped to ten materials is one round trip, not ten.
+ *
+ * IDS THE CALLER DOES NOT OWN ARE SIMPLY ABSENT from the result, exactly as a
+ * single lookup returns undefined. The caller compares lengths if it wants to
+ * distinguish "some were not yours" from "all were yours", and the study-plan
+ * validator does precisely that — but the decision of what to do about it
+ * belongs above this layer.
+ *
+ * `ORDER BY array_position` preserves the caller's ordering rather than the
+ * table's. That is what makes the MATERIAL_1/MATERIAL_2 aliases in
+ * src/study-plans/material-brief.js stable: the same request must produce the
+ * same alias for the same material every time, and `ORDER BY id` would reorder
+ * them the moment a user uploaded materials out of sequence.
+ *
+ * @param {Array<number>} ids
+ * @param {number} userId
+ * @returns {Promise<Array<object>>} public columns, caller's order, absent ids
+ *   silently omitted
+ */
+export async function findOwnedByIds(ids, userId) {
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+
+  const { rows } = await query(
+    `SELECT ${PUBLIC_COLUMNS}
+       FROM materials
+      WHERE id = ANY($1::bigint[]) AND user_id = $2
+      ORDER BY array_position($1::bigint[], id)`,
+    [ids, userId],
+  );
+  return rows;
+}
+
+/**
  * A material's storage key, only if it belongs to this user.
  *
  * Separate from findOwnedById so the key is fetched only where storage is about
