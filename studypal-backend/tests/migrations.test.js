@@ -82,14 +82,18 @@ describe("migrate() on a fresh database", () => {
     );
     assert.deepEqual(result.skipped, []);
 
-    // Every table both migrations create, in the order tableNames() returns
+    // Every table the migrations create, in the order tableNames() returns
     // them. Exact rather than a subset: a migration that quietly created an
-    // extra table would otherwise pass.
+    // extra table would otherwise pass. study_plan_tasks and study_plans were
+    // added by 004 in SP-V2-005, and the ticket that adds the next table has to
+    // come back here and say so — which is the point of the list being exact.
     assert.deepEqual(await tableNames(pool), [
       "material_chunks",
       "materials",
       "questions",
       "schema_migrations",
+      "study_plan_tasks",
+      "study_plans",
       "users",
     ]);
 

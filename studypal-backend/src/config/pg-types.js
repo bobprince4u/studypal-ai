@@ -70,4 +70,22 @@ export function registerTypeParsers() {
 
   types.setTypeParser(types.builtins.TIMESTAMPTZ, toIso);
   types.setTypeParser(types.builtins.TIMESTAMP, toIso);
+
+  /**
+   * DATE (oid 1082) as the raw 'YYYY-MM-DD' string PostgreSQL sent.
+   *
+   * The identity parser, and it is load-bearing. pg's default turns `2026-09-14`
+   * into `new Date(2026, 8, 14)` — local midnight — so a server anywhere west of
+   * Greenwich serialises it back as `2026-09-13T23:00:00.000Z`, and a client
+   * taking the first ten characters gets the day before. A study plan whose
+   * tasks all move a day when the server moves timezone is not a scheduling bug
+   * anyone finds quickly.
+   *
+   * A DATE has no time and no zone, so there is nothing to convert it TO: the
+   * string is already the whole value. Added with SP-V2-005, whose
+   * study_plans.start_date / end_date / exam_date and
+   * study_plan_tasks.scheduled_date are the first DATE columns in the schema —
+   * before them this registration would have had nothing to apply to.
+   */
+  types.setTypeParser(types.builtins.DATE, (value) => value);
 }
