@@ -20,6 +20,11 @@ import { materialRoutes } from "../materials/material.routes.js";
 // src/study-plans/, and this line is the only place the rest of the app reaches
 // into it.
 import { studyPlanRoutes } from "../study-plans/study-plan.routes.js";
+// And again: SP-V2-006 keeps routes, controller, service, repository, generator,
+// validator, grader and material brief behind src/exams/. The grader in
+// particular is reachable from nowhere else, which is what makes "Gemini does
+// not calculate scores" checkable rather than merely intended.
+import { examRoutes } from "../exams/exam.routes.js";
 
 export const routes = Router();
 
@@ -28,3 +33,4 @@ routes.use("/api", sessionRoutes);
 routes.use("/api", questionRoutes);
 routes.use("/api", materialRoutes);
 routes.use("/api", studyPlanRoutes);
+routes.use("/api", examRoutes);

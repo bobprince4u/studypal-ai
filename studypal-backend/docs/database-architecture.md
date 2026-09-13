@@ -2,15 +2,17 @@
 
 How StudyPal stores data, and why it stores it that way. Written for SP-V2-002,
 which replaced SQLite with PostgreSQL, and extended by SP-V2-003 (`materials`,
-`material_chunks`) and SP-V2-004 (pgvector embeddings and the indexing
-lifecycle).
+`material_chunks`), SP-V2-004 (pgvector embeddings and the indexing lifecycle),
+SP-V2-005 (`study_plans`, `study_plan_tasks`) and SP-V2-006 (`exams`,
+`exam_questions`, `exam_attempts`, `attempt_answers`).
 
 Companion documents: [`current-architecture.md`](./current-architecture.md) for
 the application layers, [`api-contract.md`](./api-contract.md) for the
 request/response contract these tables serve,
 [`material-processing.md`](./material-processing.md) for how an upload becomes
 chunks, [`rag-architecture.md`](./rag-architecture.md) for how those chunks
-become searchable, and
+become searchable, [`exam-architecture.md`](./exam-architecture.md) for the exam
+domain the last four tables serve, and
 [`security-baseline.md`](./security-baseline.md) for what is and is not
 protected.
 
@@ -58,28 +60,44 @@ removed from `package.json`, and the old schema is kept unexecuted at
 
 ## 2. Schema overview
 
-Six application tables plus the migration runner's bookkeeping. `users` and
+Ten application tables plus the migration runner's bookkeeping. `users` and
 `questions` came from SP-V2-002; `materials` and `material_chunks` were added by
-SP-V2-003; `study_plans` and `study_plan_tasks` by SP-V2-005.
+SP-V2-003; `study_plans` and `study_plan_tasks` by SP-V2-005; and `exams`,
+`exam_questions`, `exam_attempts` and `attempt_answers` by SP-V2-006.
 
 ```
 users
   ├── questions               one row per question asked      (SP-V2-002)
   ├── materials               one row per uploaded document   (SP-V2-003)
   │     └── material_chunks   one row per text chunk, ordered (SP-V2-003)
-  └── study_plans             one row per generated plan      (SP-V2-005)
-        └── study_plan_tasks  one row per scheduled session   (SP-V2-005)
-                └╌╌╌╌╌╌╌╌╌╌╌ may cite one material, optionally, and only
-                             ever one belonging to the same user
+  ├── study_plans             one row per generated plan      (SP-V2-005)
+  │     └── study_plan_tasks  one row per scheduled session   (SP-V2-005)
+  │           └╌╌╌╌╌╌╌╌╌╌╌╌╌ may cite one material, optionally, and only
+  │                          ever one belonging to the same user
+  └── exams                   one row per generated exam      (SP-V2-006)
+        ├── exam_questions    one row per question, ordered, WITH the answer key
+        │     └╌╌╌╌╌╌╌╌╌╌╌╌╌ may cite one material and one chunk, optionally,
+        │                    and only ever ones belonging to the same user
+        └── exam_attempts     one row per sitting             (SP-V2-006)
+              └── attempt_answers   one row per ANSWERED question; an unanswered
+                                    question is the absence of a row
 ```
 
 Everything hangs off `users.id`, and **every foreign key that expresses
 ownership is `ON DELETE CASCADE`** — deleting a user removes their questions,
 their materials, those materials' chunks, their study plans and those plans'
-tasks, in one statement. The two references added by `004` that are *not*
-ownership — a task's optional `material_id`, and a plan's optional
-`parent_plan_id` — are `ON DELETE SET NULL`, because losing the thing referred
-to does not invalidate the row referring to it.
+tasks, their exams, those exams' questions and attempts, and those attempts'
+answers, in one statement. The references that are *not* ownership — a task's
+optional `material_id` and a plan's optional `parent_plan_id` from `004`, and a
+question's optional `source_material_id` and `source_chunk_id` from `005` — are
+`ON DELETE SET NULL`, because losing the thing referred to does not invalidate
+the row referring to it.
+
+One reference is neither: `attempt_answers.exam_question_id` is `ON DELETE NO
+ACTION DEFERRABLE INITIALLY DEFERRED`, which is what lets a user delete cascade
+through two paths at once while still refusing to silently discard graded history
+when a single question is deleted. The reasoning is in the `attempt_answers`
+subsection below.
 
 ```
 ┌─────────────────────────────────────┐
@@ -352,6 +370,81 @@ only the part that is a schema decision.
 that the database itself rejects a task whose `material_id` belongs to another
 user, which is the whole reason the composite key exists.
 
+### `exams`, `exam_questions`, `exam_attempts` and `attempt_answers`
+
+Added by SP-V2-006 in migration `005`. The domain that writes them — validation,
+material grounding, generation, grading, the attempt lifecycle — is documented in
+[`exam-architecture.md`](./exam-architecture.md); what follows is only the part
+that is a schema decision.
+
+- **The answer key is a column no taking query selects.** `correct_answer` and
+  `explanation` live on `exam_questions`, and the repository builds its
+  taking-path queries from a `QUESTION_COLUMNS_FOR_TAKING` constant that does not
+  name either. That is the storage half of "the client MUST NOT receive the
+  correct answer while taking the exam": the fields are absent from the rows a
+  mid-exam response is built from, rather than filtered out of it.
+- **Four composite foreign keys, following `004`'s pattern.** `exam_questions`,
+  `exam_attempts` and `attempt_answers` each carry a denormalised `user_id` so
+  their ownership FK can be composite — a question on another learner's exam, an
+  attempt against another learner's exam, an answer on another learner's attempt,
+  and a question citing another learner's material are all **unrepresentable**
+  rather than merely checked in the service. `exams_id_user_key` and
+  `exam_attempts_id_user_key` exist to be the targets.
+- **`attempt_answers.exam_question_id` is `DEFERRABLE INITIALLY DEFERRED`**, and
+  it is the only deferred constraint in the schema. Two deletions have to behave
+  differently: deleting a user or an exam must succeed, and deleting one question
+  of an already-attempted exam must fail. The cascade reaches these rows by two
+  paths — exam → questions, and exam → attempts → answers — and PostgreSQL runs
+  each as its own statement, so an immediate or end-of-statement check fires
+  while the sibling cascade has not run yet and aborts the whole delete. Both
+  were tried; with either, `DELETE FROM users` fails outright. Deferring to
+  COMMIT gives both behaviours. `CASCADE` would also permit the user delete, but
+  it would silently delete graded history on a single-question delete — and
+  graded history is what SP-V2-007 reads.
+- **`exam_attempts_result_matches_status` is the state machine as a CHECK.**
+  Either `status = 'in_progress'` with `submitted_at`, `score`,
+  `total_questions`, `correct_answers`, `percentage` and `passed` all NULL, or
+  `status = 'completed'` with all six present. A half-graded attempt is not
+  storable, by any writer.
+- **`correct_answers <= total_questions` and `score = correct_answers`.** The
+  first makes an impossible grade fail at the INSERT instead of quietly becoming
+  a 120% result; the second catches the two writers of §9's two names for one
+  count disagreeing. `percentage` is `INTEGER` rather than `NUMERIC` because it
+  is `Math.round(…)` by construction, and the rounding rule lives in exactly one
+  module.
+- **`attempt_answers.selected_answer` is `NOT NULL`, so an unanswered question
+  has no row.** Not a row with a NULL selection. That is what lets "unanswered"
+  be counted as wrong without being confused for "answered with nothing", and it
+  lets the grading tests assert on row count as well as on score.
+- **`is_correct` is `NOT NULL` and no SQL in the write path computes it.** It is
+  written from the comparison in `src/exams/grader.js`, inside the submission
+  transaction, so the marking rule does not exist twice. The API gives a client
+  no way to supply it: the grader's input is built solely from
+  `{questionId, answer}`, and the validation middleware has no reader for
+  `isCorrect` at all.
+- **`attempt_answers_attempt_question_key UNIQUE (attempt_id,
+  exam_question_id)`** is the duplicate-answer rule. The service also rejects a
+  payload naming the same question twice with a `400`; the constraint is what
+  holds under a concurrent double-submit.
+- **`exams.status` has two values, not five.** `ready` and `cancelled`, where
+  `cancelled` is a seam with no writer — the same deliberate choice as
+  `study_plans`. `exam_attempts.status` likewise has `in_progress` and
+  `completed` and nothing else: no `abandoned`, no `expired`, because nothing in
+  SP-V2-006 expires an attempt and a state nothing writes would be a guess about
+  SP-V2-007 encoded as a constraint.
+- **`exams.material_ids BIGINT[]` is a record of the request**, exactly as
+  `study_plans.material_ids` is, and carries the same dangling caveat —
+  limitation 15 applies to both. `topics TEXT[]` is the same kind of column: what
+  was asked for, preserved for SP-V2-007, not a live reference.
+- **`source_type` records what was retrieved, not what was requested.** It is
+  `'material'` only when material actually reached the model; a request naming
+  documents none of whose chunks were retrievable produced a topic-only exam, and
+  recording it otherwise would misdescribe it to the analytics iteration.
+
+`tests/exams/schema.test.js` asserts each of these through SQL — including each
+of the four crossing INSERTs the composite keys are there to refuse, and both
+halves of the deferred-constraint behaviour.
+
 ### Types, and why the API did not change
 
 | Decision | Reason |
@@ -376,7 +469,7 @@ shapes.
 
 ## 3. Indexes
 
-Six indexes exist beyond what the PK and UNIQUE constraints create, and each
+Ten indexes exist beyond what the PK and UNIQUE constraints create, and each
 one serves a query in the code today. No speculative indexes: every index costs
 write throughput and disk, and an unused one is pure loss.
 
@@ -387,6 +480,10 @@ write throughput and disk, and an unused one is pure loss.
 | `idx_materials_user_created (user_id, created_at DESC)` | `GET /api/materials?username=…` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2` | Same shape and same reasoning as the history index, and the only material query no PK or UNIQUE constraint already covers. This is §29's "index material ownership". |
 | `idx_study_plans_user_created (user_id, created_at DESC)` | `GET /api/study-plans?username=…` — `WHERE user_id = $1 ORDER BY created_at DESC, id DESC` | The third instance of the same shape, for the third list-my-own-rows endpoint. This is §51's "index `user_id`". |
 | `idx_study_plan_tasks_material (material_id, user_id) WHERE material_id IS NOT NULL` | The referential check behind `DELETE /api/materials/:id` — PostgreSQL must find tasks pointing at the material being deleted | **Partial.** Most tasks cite no material (§7: not every task has one), and a NULL row has nothing to find, so the predicate keeps the index proportional to the grounded tasks rather than to all of them. Without it, every material deletion sequentially scans every task in the database. Column order matches the foreign key's own. |
+| `idx_exams_user_created (user_id, created_at DESC)` | No read today — SP-V2-006 §9 names six routes and a "list my exams" is not one of them | The referencing side of `exams`' own user FK, which PostgreSQL does not index for you: without it, `ON DELETE CASCADE` from `users` sequentially scans every exam. The `created_at DESC` tail costs nothing extra and is what a later listing would read. |
+| `idx_exam_attempts_user_started (user_id, started_at DESC)` | `GET /api/exam-attempts?username=…` — a learner's attempt history, newest first | The fourth instance of the list-my-own-rows shape. `started_at` rather than `created_at` because the history is ordered by when the sitting began, which is what the API returns. |
+| `idx_exam_attempts_exam (exam_id)` | Attempts of one exam, and the cascade from `exams` | Same reason as the two above: the referencing side of a foreign key is not indexed for you, so without it a deleted exam scans every attempt. |
+| `idx_exam_questions_source_material (source_material_id) WHERE source_material_id IS NOT NULL` | `ON DELETE SET NULL` from `materials` — PostgreSQL must find the questions to null out | **Partial**, for the same reason as the task index above: a topic-only exam's questions have no source, and no query wants the NULL rows. |
 | `users_username_key` (from the UNIQUE constraint) | Every endpoint — each resolves a username to a `user_id` first | Also the constraint `POST /api/session` relies on via `ON CONFLICT (username)`. |
 
 `material_chunks` gets **no added index**. Its `UNIQUE (material_id,
@@ -420,14 +517,29 @@ records the trigger for revisiting it and the single `CREATE INDEX … USING hns
 index either — the one query filtering on it is already scoped by primary key, and
 a single-column index on a four-value column would never be chosen.
 
+**`exam_questions` and `attempt_answers` get nothing for their hot reads**, for
+the third time and the same reason. `UNIQUE (exam_id, question_order)` is exactly
+the index "the questions of exam N, in order" wants, and
+`UNIQUE (attempt_id, exam_question_id)` serves "the answers of attempt N" as well
+as being the duplicate-answer constraint. Both had to exist for correctness; that
+they are also the two indexes the query plans want is why `005` adds only the
+four above, none of which duplicate a constraint's leading column.
+
 `tests/schema.test.js` asserts the exact index list on `questions`,
 `tests/materials/schema.test.js` does the same for both material tables, and
-`tests/study-plans/schema.test.js` for both plan tables, so adding one fails a
-test and prompts a justification. All three suites also run `EXPLAIN` against the
-queries these indexes exist for, at a few thousand rows, and assert the planner
-actually uses them — an index PostgreSQL declines to use is the same as no index,
-and at fixture scale a sequential scan genuinely is cheaper, so the tests build
-enough rows to reach the regime the index exists for.
+`tests/study-plans/schema.test.js` for both plan tables, so adding one there
+fails a test and prompts a justification. Those three suites also run `EXPLAIN`
+against the queries these indexes exist for, at a few thousand rows, and assert
+the planner actually uses them — an index PostgreSQL declines to use is the same
+as no index, and at fixture scale a sequential scan genuinely is cheaper, so the
+tests build enough rows to reach the regime the index exists for.
+
+`tests/exams/schema.test.js` is weaker on both counts, deliberately: it asserts
+that the four indexes above **exist** and that the source-material one is
+partial, but not that the list is exact and not that the planner chooses them.
+Three of the four are there for cascades rather than for a read, so there is no
+query to `EXPLAIN`, and the fourth serves a listing whose plan is already covered
+by the identical shape on three other tables.
 
 ---
 
@@ -663,19 +775,21 @@ name that none of the reserved tables exist, so creating one early fails a test.
 
 | Feature | Expected shape | Attaches to |
 | --- | --- | --- |
-| Exams and attempts | `exams`, `exam_questions`, `exam_attempts`, `attempt_answers` | `exams.user_id → users.id` |
 | Learning analytics | `learning_events` | `learning_events.user_id → users.id` |
 | Real accounts | `password_hash`, `email_verified_at` on `users`; a `sessions` table that actually holds sessions | The nullable columns already on `users` |
 | Multi-turn material chat | `conversations`, `conversation_messages` | `conversations.user_id → users.id`; each question is independent today |
 
-Three rows have left this table by being built. SP-V2-003 created `materials` and
+Four rows have left this table by being built. SP-V2-003 created `materials` and
 `material_chunks`; **SP-V2-004 added semantic search over them** — the `vector`
 extension, `material_chunks.embedding` as `vector(1536)`, and the
-`indexing_status` lifecycle, all in migration `003`; and **SP-V2-005 created
-`study_plans` and `study_plan_tasks`** in migration `004`. All now live in §2,
-and [`rag-architecture.md`](./rag-architecture.md) and
-[`study-plan-architecture.md`](./study-plan-architecture.md) document the
-features built on them.
+`indexing_status` lifecycle, all in migration `003`; **SP-V2-005 created
+`study_plans` and `study_plan_tasks`** in migration `004`; and **SP-V2-006
+created `exams`, `exam_questions`, `exam_attempts` and `attempt_answers`** in
+migration `005`. All now live in §2, and
+[`rag-architecture.md`](./rag-architecture.md),
+[`study-plan-architecture.md`](./study-plan-architecture.md) and
+[`exam-architecture.md`](./exam-architecture.md) document the features built on
+them.
 
 The study-plan tables landed with one shape this table did not predict:
 `study_plan_tasks` attaches to `study_plans` through a **composite** foreign key
@@ -684,6 +798,15 @@ carrying `user_id`, not through `study_plan_id` alone. The prediction
 task table needed more, because a task can also cite a material, and only a
 composite key can make "cite *someone else's* material" impossible rather than
 merely checked. §2 covers the reasoning.
+
+The exam tables landed the same way, and the prediction `exams.user_id →
+users.id` was likewise right only for the parent. All three child tables carry a
+denormalised `user_id` so their ownership keys can be composite — the pattern
+`004` established, applied four more times. One thing this table could not have
+predicted at all: `attempt_answers.exam_question_id` had to be **deferrable**,
+because a graded answer is referenced by two cascade paths that PostgreSQL runs
+as separate statements. That is the only deferred constraint in the schema, and
+§2 explains why nothing simpler works.
 
 What `003` deliberately did **not** create is an ANN index on the vector column:
 exact search has perfect recall, the per-user filter keeps each query small, and
@@ -720,4 +843,7 @@ new numbered file in `migrations/postgres/`; the existing ones are immutable.
 | 16 | **"Today" is the server's UTC today**, and study plans are `DATE` columns | A learner in UTC+13 asking for a plan at 10am on the 15th gets one starting on the 14th, because that is still the date in UTC. The alternative — trusting a client-supplied date — is worse, since it lets a caller schedule into the past. A real fix is a per-user timezone on `users`, which is a product decision no requirement has asked for yet. |
 | 17 | **Archived plans accumulate.** Every regeneration inserts a new plan and archives the old one; nothing prunes the chain | Deliberate — the old plan holds task progress a learner may have made, and §30 is explicit that regeneration must not overwrite. But a learner who regenerates twenty times has twenty rows, all returned by `GET /api/study-plans`, which has no status filter. Same family as limitation 6: fine at current scale, a retention decision later. |
 | 18 | **`GET /api/study-plans` is capped, not paginated** | It reuses the material list ceiling and returns the newest N with no cursor, so a learner past that count cannot reach their oldest plans through the API. The cap exists to bound the response; pagination is the thing that was not built, and the same is true of the other two list endpoints. |
-| 19 | **`updated_at` on both new tables is maintained by the repository, not by a trigger** | Every `UPDATE` sets it explicitly. Identical exposure to limitations 4 and 9: a future writer that forgets leaves it stale, and nothing catches that. The consistent fix across all four tables is one trigger function, which is a migration nobody has needed badly enough yet. |
+| 19 | **`updated_at` is maintained by the repository on every table that has it, never by a trigger** | Both study-plan tables, and `exams` and `exam_attempts` after them, set it explicitly in each `UPDATE` — `completeAttempt` is the only writer on the exam side. Identical exposure to limitations 4 and 9: a future writer that forgets leaves it stale, and nothing catches that. The consistent fix across all six tables is one trigger function, which is a migration nobody has needed badly enough yet. |
+| 20 | **`bigint[]` columns arrive as arrays of strings.** `src/config/pg-types.js` registers a parser for oid 20 (scalar `BIGINT`) but not for oid 1016 (`bigint[]`), so `["1", "2"]` comes back where `[1, 2]` is expected. Verified empirically against PostgreSQL 16; `int[]` is unaffected | Worked around locally rather than globally: `src/exams/exam.repository.js` maps `material_ids` through `Number` so the exam API returns numbers, and `tests/exams/api.test.js` asserts the type. `study_plans.material_ids` has the same type and the same behaviour, but SP-V2-005 never returns that column to a client, so nothing is broken there today. Registering oid 1016 globally would change what a shipped feature's queries receive, which is why it was reported rather than done inside an exam ticket. The local coercion is a no-op once the parser is registered, so the real fix cannot break it. |
+| 21 | **Nothing prunes exams or attempts.** Every generation is a new `exams` row with its questions, and every sitting a new `exam_attempts` row with its answers | The same family as limitations 6 and 17, with a faster clock: a learner practising daily accumulates rows on four tables, and `GET /api/exam-attempts` is capped rather than paginated (limitation 18 applies to it too). Deliberate for now — attempt history is precisely what SP-V2-007 consumes, so pruning it is a decision that iteration should make, not this one. |
+| 22 | **A deleted material leaves its exam questions in place, unattributed.** `exam_questions.source_material_id` is `ON DELETE SET NULL`, so the question survives with no citation | Correct for grading — an exam a learner already sat must not change because a PDF was removed, and the answer key is on the question row rather than in the document. But `sourceType` still says `'material'` for that exam, so an exam can claim material provenance while none of its questions can name a source. Harmless today; anything in SP-V2-007 that groups results by material must treat a null `source_material_id` as "unknown" rather than assuming a topic-only exam. |

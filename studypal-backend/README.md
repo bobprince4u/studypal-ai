@@ -187,6 +187,12 @@ allowed regardless, so configuring a deployment does not break local work.
 | `GET` | `/api/study-plans/:id` | `?username=` | `200` — the plan with its tasks |
 | `PATCH` | `/api/study-plans/:planId/tasks/:taskId` | JSON `{username, status}` | `200` — the updated task |
 | `POST` | `/api/study-plans/:id/regenerate` | JSON `{username}` | `201` — a **new** plan, the old one archived |
+| `POST` | `/api/exams` | JSON — subject, topics, difficulty, question count, types, materials | `201` — the exam with its questions, **no answer key** |
+| `GET` | `/api/exams/:id` | `?username=` | `200` — the exam with its questions, still no key |
+| `POST` | `/api/exams/:id/attempts` | JSON `{username}` | `201` — the attempt, questions nested under `exam` |
+| `POST` | `/api/exams/:id/attempts/:attemptId/submit` | JSON `{username, answers[]}` | `200` — the graded result, **with** the key |
+| `GET` | `/api/exams/:id/attempts/:attemptId` | `?username=` | `200` — the attempt; the key only once submitted |
+| `GET` | `/api/exam-attempts` | `?username=` | `200` — array, newest first, ≤ `MATERIAL_LIST_LIMIT` |
 
 Errors are always JSON: `{"error": "<message>"}`.
 
@@ -206,9 +212,10 @@ error case, is in [`docs/api-contract.md`](./docs/api-contract.md) — that file
 deliberately frozen at the contract it was written to protect. The endpoints each
 later feature added are documented with that feature:
 [`docs/material-processing.md`](./docs/material-processing.md) for uploads,
-[`docs/rag-architecture.md`](./docs/rag-architecture.md) for material chat, and
+[`docs/rag-architecture.md`](./docs/rag-architecture.md) for material chat,
 [`docs/study-plan-architecture.md`](./docs/study-plan-architecture.md) §9 for
-study plans.
+study plans, and [`docs/exam-architecture.md`](./docs/exam-architecture.md) §9
+for exams.
 
 ### Study materials
 
@@ -338,25 +345,80 @@ normalization choices (§21 clamping, §22 dropping the tail) and the deferred w
 are in
 [`docs/study-plan-architecture.md`](./docs/study-plan-architecture.md).
 
+### Exams
+
+`POST /api/exams` generates a practice exam from a subject, some topics, and
+optionally the learner's own uploaded materials:
+
+```
+{username, subject, topics[], difficulty, questionCount, questionTypes[],
+ materialIds[]}
+  → validate everything server-side  (bounds from config.exam)
+  → brief the model on their own materials, retrieved as [Source N] extracts
+  → Gemini                           (structured output: {title, questions[]})
+  → validate the output              (reject, never repair; at most one retry)
+  → one transaction                  (exam + questions, opened after generation)
+→ 201 {id, title, subject, difficulty, questionCount, status, sourceType,
+       topics, materialIds, questions[]}
+```
+
+Then the sitting is three more requests: start an attempt, submit answers, read
+the result — plus `GET /api/exam-attempts` for the history.
+
+**The answer key never leaves the server before submission.** It is a column on
+`exam_questions` that the taking-path queries do not select, so a mid-exam
+response is built from rows that do not contain it — the field is absent from the
+input, not filtered out of the output. After submission the same endpoints return
+`correctAnswer`, `explanation`, `selectedAnswer` and `isCorrect` per question.
+
+**The backend grades, and Gemini is never asked to.** `src/exams/grader.js` is a
+pure function: `selectedAnswer === correctAnswer`, then
+`Math.round((correct / total) * 100)`, then compared against a single configured
+threshold (`STUDYPAL_EXAM_PASSING_PERCENTAGE`, default 70). It imports nothing but
+config — no database, no provider, no clock — so the same submission always
+produces the same result. Unanswered questions count as wrong, deliberately:
+scoring over attempted questions only would make skipping the hard ones optimal
+and would make two attempts at one exam incomparable.
+
+**A client cannot assert anything about correctness.** The submit body is
+`{questionId, answer}` pairs and nothing else; there is no field in which a
+score, a percentage, an `isCorrect` or a `passed` could arrive, so there is
+nothing to filter out.
+
+**An attempt is `in_progress` then `completed`, and completed is immutable.** A
+second submission gets a `409` and the original result stands — enforced twice,
+once as a check and once as a compare-and-set inside the `UPDATE`, which is what
+makes it hold when two submissions race rather than merely when they queue.
+
+**Ownership is four composite foreign keys**, so a question on another learner's
+exam, an attempt against their exam, an answer on their attempt, and a question
+citing their material are unrepresentable rather than merely rejected. Every
+ownership failure answers `404`, not `403`.
+
+The schema, the grading rules, the AI boundary, the attempt lifecycle and the
+deferred work are in
+[`docs/exam-architecture.md`](./docs/exam-architecture.md).
+
 ### Note on identity
 
 A "username" is an unverified string. There is no password, no token and no
 authorization check: anyone who knows or guesses a username can read that
 student's history, list, read and delete their uploaded materials, ask questions
-of those materials and read passages of them back in the answer, and now **read
-and modify their study plans**. Ownership *is* enforced — student A cannot reach
-student B's material or plan by id, retrieval's SQL constrains every search to
-one user, and a task citing another user's material is rejected by the database
-itself — but nothing stops someone claiming to **be** student B. This is the
-pre-existing behaviour, kept deliberately for now — see
-[`docs/security-baseline.md`](./docs/security-baseline.md) (S1). Each iteration
-makes it matter more: this API is not fit for real student data until
+of those materials and read passages of them back in the answer, read and modify
+their study plans, and now **generate exams as them, sit those exams, and read
+their attempt history and scores**. Ownership *is* enforced — student A cannot
+reach student B's material, plan, exam or attempt by id, retrieval's SQL
+constrains every search to one user, and a task or question citing another user's
+material is rejected by the database itself — but nothing stops someone claiming
+to **be** student B. This is the pre-existing behaviour, kept deliberately for
+now — see [`docs/security-baseline.md`](./docs/security-baseline.md) (S1). Each
+iteration makes it matter more: this API is not fit for real student data until
 authentication exists.
 
 ## Tests
 
 ```bash
-npm test              # 626 tests in 129 suites
+npm test              # 826 tests in 169 suites
 npm run test:baseline # 35 — the API-contract subset
 npm run characterize  # print observed behaviour across ~30 request variants
 ```
@@ -510,6 +572,40 @@ named `studypal_test_run_%` and cleared by `dropStaleTestDatabases()`.
   is new rather than restating the tree-wide rules the materials suite already
   covers, and carries the same counter-assertions.
 
+- **`tests/exams/schema.test.js`** (47) — the four exam tables through SQL: every
+  column and CHECK constraint, the four composite foreign keys each proved by the
+  database **refusing the crossing INSERT**, the duplicate-answer unique key, the
+  result-matches-status state machine, and both halves of the deferred constraint
+  — a user delete cascading through two paths, and a single question delete
+  refused because an attempt referenced it.
+
+- **`tests/exams/grading.test.js`** (38) — the grader as a pure function: correct
+  and incorrect marking, unanswered questions counted as wrong, the rounding rule
+  at the boundaries, the threshold at exactly 70, an injected threshold, and the
+  answer key **absent from every response before submission and present after**.
+
+- **`tests/exams/api.test.js`** (56) — the six endpoints over real HTTP: the
+  generation contract, every validation rejection, ownership isolation between two
+  users, the attempt lifecycle, double submission returning `409` with the
+  original score intact, and a full journey from upload through grading. The
+  answer-key check recurses the whole response body by key name at any depth,
+  rather than asserting on the fields it expects to be missing.
+
+- **`tests/exams/generation.test.js`** (24) — what happens when the model
+  misbehaves: eleven kinds of unusable output, each refused before anything is
+  written; the single bounded retry, and the give-up after it; a refused
+  generation asserted to leave **no exam and no question** and a still-usable
+  server; over-long text clamped rather than rejected; invented source references
+  dropped while the question survives; and a real reference resolved to its
+  material and chunk.
+
+- **`tests/exams/architecture.test.js`** (35) — the SP-V2-006 boundaries: SQL
+  confined to the exam repository, the grader importing no provider and no
+  database, the score computed in exactly one place inside the transaction, the
+  taking column list not naming the key, no second RAG implementation under
+  `src/exams/`, and a list endpoint returning a bare array rather than inventing
+  a second response envelope.
+
 ## Architecture
 
 ```
@@ -535,6 +631,11 @@ src/
                    deterministic domain (study-calendar, plan-normalizer,
                    material-brief). Reuses src/materials/ retrieval; owns every
                    date itself
+  exams/           the SP-V2-006 feature, self-contained: routes, controller,
+                   service, repository, generator, AI-output validator, validation
+                   middleware, material-brief, and grader.js — the pure function
+                   that owns every score. Reuses src/materials/ retrieval; the
+                   answer key never leaves the server before submission
   storage/         local-storage.service.js — the only module that touches the
                    filesystem: save, read, delete, exists, over generated keys
   middleware/      cors, validation, upload, security headers, error handler
@@ -550,27 +651,28 @@ Controllers contain no SQL and no provider calls; services never touch `req` or
 imported by `src/config/database.js`, `src/config/pg-types.js` and the test
 helpers, and by nothing else. `@google/genai` is imported by
 `src/ai/gemini.client.js` and nothing else — not by a repository, not by a
-controller, not by a retrieval module, not by the plan generator. `node:fs` is
-imported by exactly three modules: `src/storage/local-storage.service.js`, which
-is the storage abstraction itself, plus `src/db/migrator.js` (reads the migration
-files) and `src/utils/version.js` (reads `package.json` for `/health`) — both
-startup-time, neither on a request path. Nothing in `src/materials/` or
-`src/study-plans/` touches the filesystem directly, and the vector SQL lives in
-exactly one function in one repository.
+controller, not by a retrieval module, not by the plan generator, not by the exam
+generator. `node:fs` is imported by exactly three modules:
+`src/storage/local-storage.service.js`, which is the storage abstraction itself,
+plus `src/db/migrator.js` (reads the migration files) and `src/utils/version.js`
+(reads `package.json` for `/health`) — both startup-time, neither on a request
+path. Nothing in `src/materials/`, `src/study-plans/` or `src/exams/` touches the
+filesystem directly, and the vector SQL lives in exactly one function in one
+repository.
 
-Two feature folders reach across the tree, and only in one direction:
+Three feature folders reach across the tree, and only in one direction:
 `src/routes/index.js` mounts each feature's router, and
-`src/study-plans/material-brief.js` imports the retrieval service and context
-builder rather than growing a second copy of them. Both directories are stated as
-an exact allowlist, so a third importer fails a test — and so does either of
-those two ceasing to import, which would mean the reuse had been replaced by a
-duplicate.
+`src/study-plans/material-brief.js` and `src/exams/material-brief.js` import the
+retrieval service and context builder rather than growing a second copy of them.
+Those importers are stated as an exact allowlist, so a fourth fails a test — and
+so does any of the three ceasing to import, which would mean the reuse had been
+replaced by a duplicate.
 
-`tests/materials/architecture.test.js` and `tests/study-plans/architecture.test.js`
-assert all of that by reading the source tree, so a layering rule cannot quietly
-stop being true while the tests stay green — and each rule is paired with an
-assertion that its pattern still matches something, so the check cannot go
-vacuous either.
+`tests/materials/architecture.test.js`, `tests/study-plans/architecture.test.js`
+and `tests/exams/architecture.test.js` assert all of that by reading the source
+tree, so a layering rule cannot quietly stop being true while the tests stay
+green — and each rule is paired with an assertion that its pattern still matches
+something, so the check cannot go vacuous either.
 
 [`docs/database-architecture.md`](./docs/database-architecture.md) covers the
 schema, the indexes and why each exists, the migration strategy, and connection

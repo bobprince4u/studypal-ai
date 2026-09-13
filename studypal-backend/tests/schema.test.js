@@ -440,13 +440,18 @@ describe("scope", () => {
     const { rows } = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
     );
-    // material_chunks and materials joined this list in SP-V2-003, and
-    // study_plans/study_plan_tasks in SP-V2-005, which is the only reason any of
-    // them are here: the assertion is still exact, so the next ticket that adds
-    // a table has to come back and say so.
+    // material_chunks and materials joined this list in SP-V2-003,
+    // study_plans/study_plan_tasks in SP-V2-005, and the four exam tables in
+    // SP-V2-006, which is the only reason any of them are here: the assertion is
+    // still exact, so the next ticket that adds a table has to come back and say
+    // so.
     assert.deepEqual(
       rows.map((r) => r.tablename),
       [
+        "attempt_answers",
+        "exam_attempts",
+        "exam_questions",
+        "exams",
         "material_chunks",
         "materials",
         "questions",
@@ -455,22 +460,19 @@ describe("scope", () => {
         "study_plans",
         "users",
       ],
-      "the data foundation, SP-V2-003's materials and SP-V2-005's study plans — no other feature tables yet",
+      "the data foundation, SP-V2-003's materials, SP-V2-005's study plans and SP-V2-006's exams — no other feature tables yet",
     );
   });
 
   it("has not created the tables reserved for later tickets", async () => {
-    // Named explicitly so a premature `CREATE TABLE exams` fails here rather
-    // than shipping an empty table nothing reads. `materials` and
+    // Named explicitly so a premature `CREATE TABLE learning_events` fails here
+    // rather than shipping an empty table nothing reads. `materials` and
     // `material_chunks` were on this list until SP-V2-003 created them;
-    // `study_plans` and `study_plan_tasks` until SP-V2-005 did. All four are
-    // asserted above instead — they move rather than being deleted, so the list
-    // of what is still deferred stays honest.
+    // `study_plans` and `study_plan_tasks` until SP-V2-005 did; and the four
+    // exam tables until SP-V2-006 did. All eight are asserted above instead —
+    // they move rather than being deleted, so the list of what is still deferred
+    // stays honest. learning_events is SP-V2-007's, and is still deferred.
     const reserved = [
-      "exams",
-      "exam_questions",
-      "exam_attempts",
-      "attempt_answers",
       "learning_events",
       "sessions", // replaced by `users`
     ];

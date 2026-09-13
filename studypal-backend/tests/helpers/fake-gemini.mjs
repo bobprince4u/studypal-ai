@@ -91,6 +91,32 @@
  *   Setting FAKE_GEMINI_MODE=http-error and still receiving a 200 is what proves
  *   an endpoint did NOT call the generation API.
  *
+ *   FAKE_EXAM_MODE       generation for POST /api/exams (SP-V2-006), recognised
+ *                        by `correctAnswer` in its responseJsonSchema. Every
+ *                        invalid mode corresponds to a rejection §7 or §8 names.
+ *     "valid"         → a paper sized to the count the prompt states  (default)
+ *     "all-mcq"       → every question multiple choice
+ *     "all-boolean"   → every question true/false
+ *     "invent-source" → sourceNumber 99, which no prompt contains (§14 dropping)
+ *     "prose"         → not JSON at all (§7)
+ *     "empty-questions" → a well-formed exam with zero questions (§7)
+ *     "no-title"      → questions present, title missing
+ *     "too-few"       → one question short of the request (§8)
+ *     "too-many"      → one question over the request (§8)
+ *     "bad-type"      → type "essay", which §2 excludes
+ *     "three-options" → an MCQ with three options rather than four (§8)
+ *     "duplicate-options" → two options sharing an id (§7)
+ *     "answer-not-an-option" → correctAnswer "Z" with options A-D (§7, §8)
+ *     "no-explanation"→ a blank explanation (§7)
+ *     "empty-question-text" → blank question text (§7)
+ *     "long-text"     → question and explanation far over the column bounds
+ *     "retry-once"    → invalid on the first call, valid on the second, which is
+ *                       the only way to observe §8's single controlled retry
+ *
+ *   FAKE_EXAM_MODE governs only the RESPONSE SHAPE too. An exam test that needs
+ *   the provider itself to fail sets FAKE_GEMINI_MODE — which is how §16's
+ *   "Gemini failure handled" case is written.
+ *
  * The vectors come from tests/fixtures/vectors.mjs, whose orthonormal-basis design
  * is what makes retrieval ordering predictable on paper (§35).
  */
@@ -404,6 +430,240 @@ function planBodyForMode(mode, requestBody) {
   }
 }
 
+/** The exam title the exam modes return, so a test can assert on it. */
+export const CANNED_EXAM_TITLE = "Photosynthesis Practice Exam";
+
+/**
+ * Is this generation call the exam one?
+ *
+ * Same technique as the chat and plan detectors, and the marker is again a
+ * field name unique to one schema: `correctAnswer` appears in
+ * EXAM_RESPONSE_SCHEMA and nowhere else. /api/ask sends no responseJsonSchema
+ * at all, the chat schema names `sourceIndexes` and the plan schema names
+ * `durationMinutes`, so all four generation paths are distinguishable without
+ * any test having to remember to set a flag.
+ */
+function isExamRequest(init) {
+  return typeof init?.body === "string" && init.body.includes("correctAnswer");
+}
+
+/**
+ * How many questions the prompt asked for, read back out of it.
+ *
+ * The fake sizes its response to what it was actually asked for, rather than to
+ * a constant that would silently stop matching when a test changes the count.
+ * The line is emitted by formatExamRequest in src/ai/prompts/exam.prompt.js.
+ *
+ * A prompt that did not state a count is a prompt-construction bug, and the
+ * small fallback makes the resulting test failure a short readable diff rather
+ * than a fifty-question one.
+ */
+function examQuestionCount(body) {
+  const match = /Number of questions: exactly (\d+)/.exec(promptText(body));
+  const count = match ? Number(match[1]) : 0;
+  return Number.isInteger(count) && count > 0 ? count : 2;
+}
+
+/** Which types the prompt allows, so "valid" never returns an unrequested one. */
+function examAllowsType(body, type) {
+  const match = /Question types allowed: (.+)/.exec(promptText(body));
+  return match ? match[1].includes(type) : true;
+}
+
+/** One multiple-choice question, cycling the key so a paper is not all "A". */
+function mcqQuestion(index, { source }) {
+  const correct = ["A", "B", "C", "D"][index % 4];
+  return {
+    type: "multiple_choice",
+    question: `Question ${index + 1}: which statement about photosynthesis is correct?`,
+    options: [
+      { id: "A", text: "It converts light energy into chemical energy." },
+      { id: "B", text: "It occurs only in the mitochondria." },
+      { id: "C", text: "It consumes oxygen and releases carbon dioxide." },
+      { id: "D", text: "It requires no water at any stage." },
+    ],
+    correctAnswer: correct,
+    explanation: `Option ${correct} is the one consistent with the light-dependent reactions.`,
+    ...(source ? { sourceNumber: source } : {}),
+  };
+}
+
+/** One true/false question, alternating the key for the same reason. */
+function booleanQuestion(index, { source }) {
+  return {
+    type: "true_false",
+    question: `Question ${index + 1}: photosynthesis releases oxygen as a by-product.`,
+    options: [
+      { id: "true", text: "True" },
+      { id: "false", text: "False" },
+    ],
+    correctAnswer: index % 2 === 0 ? "true" : "false",
+    explanation: "Oxygen comes from the splitting of water in photosystem II.",
+    ...(source ? { sourceNumber: source } : {}),
+  };
+}
+
+/**
+ * The exam body for one mode.
+ *
+ * Every invalid mode here corresponds to a rejection §7 or §8 names, so the
+ * validator's branches are exercised through the real HTTP path rather than
+ * only in unit tests.
+ */
+function examBodyForMode(mode, requestBody) {
+  const count = examQuestionCount(requestBody);
+  const sourceCount = countSources(requestBody);
+  const source = sourceCount > 0 ? 1 : null;
+
+  // Types are alternated only when both are allowed, so a request that asked for
+  // one kind of paper gets one kind back — which is itself part of what the
+  // validator checks.
+  const mcqOnly = !examAllowsType(requestBody, "true_false");
+  const booleanOnly = !examAllowsType(requestBody, "multiple_choice");
+
+  const question = (index) => {
+    if (mcqOnly) return mcqQuestion(index, { source });
+    if (booleanOnly) return booleanQuestion(index, { source });
+    return index % 2 === 0
+      ? mcqQuestion(index, { source })
+      : booleanQuestion(index, { source });
+  };
+
+  const valid = {
+    title: CANNED_EXAM_TITLE,
+    questions: Array.from({ length: count }, (_, i) => question(i)),
+  };
+
+  switch (mode) {
+    case "all-mcq":
+      return JSON.stringify({
+        ...valid,
+        questions: Array.from({ length: count }, (_, i) =>
+          mcqQuestion(i, { source }),
+        ),
+      });
+
+    case "all-boolean":
+      return JSON.stringify({
+        ...valid,
+        questions: Array.from({ length: count }, (_, i) =>
+          booleanQuestion(i, { source }),
+        ),
+      });
+
+    case "invent-source":
+      // §14. A source number no prompt has ever contained. The reference must be
+      // dropped and the question kept.
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map((q) => ({ ...q, sourceNumber: 99 })),
+      });
+
+    case "prose":
+      return "Here is a lovely exam, described in prose. No JSON at all.";
+
+    case "empty-questions":
+      return JSON.stringify({ ...valid, questions: [] });
+
+    case "no-title":
+      return JSON.stringify({ ...valid, title: "   " });
+
+    case "too-few":
+      // §8. One short of what was asked for — must never be persisted.
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.slice(0, Math.max(0, count - 1)),
+      });
+
+    case "too-many":
+      return JSON.stringify({
+        ...valid,
+        questions: [...valid.questions, mcqQuestion(count, { source })],
+      });
+
+    case "bad-type":
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map((q) => ({ ...q, type: "essay" })),
+      });
+
+    case "three-options":
+      // §8's "exactly 4 options" for multiple choice.
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map(() => ({
+          ...mcqQuestion(0, { source }),
+          options: mcqQuestion(0, { source }).options.slice(0, 3),
+          correctAnswer: "A",
+        })),
+      });
+
+    case "duplicate-options":
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map(() => ({
+          ...mcqQuestion(0, { source }),
+          options: [
+            { id: "A", text: "First" },
+            { id: "A", text: "Duplicate id" },
+            { id: "C", text: "Third" },
+            { id: "D", text: "Fourth" },
+          ],
+          correctAnswer: "A",
+        })),
+      });
+
+    case "answer-not-an-option":
+      // §7, §8. The key names an option the question does not have.
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map(() => ({
+          ...mcqQuestion(0, { source }),
+          correctAnswer: "Z",
+        })),
+      });
+
+    case "no-explanation":
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map((q) => ({ ...q, explanation: "   " })),
+      });
+
+    case "empty-question-text":
+      return JSON.stringify({
+        ...valid,
+        questions: valid.questions.map((q) => ({ ...q, question: "  " })),
+      });
+
+    case "long-text":
+      return JSON.stringify({
+        ...valid,
+        title: "T".repeat(600),
+        questions: valid.questions.map((q) => ({
+          ...q,
+          question: "Q".repeat(5000),
+          explanation: "E".repeat(5000),
+        })),
+      });
+
+    case "retry-once": {
+      // §8. The first call is refused by the validator, the second succeeds — so
+      // a test can assert both that one retry happens and that it produces a
+      // single exam rather than two.
+      const seen = (examCallCounts.get("retry-once") ?? 0) + 1;
+      examCallCounts.set("retry-once", seen);
+      return seen === 1 ? "not json at all, on purpose" : JSON.stringify(valid);
+    }
+
+    case "valid":
+    default:
+      return JSON.stringify(valid);
+  }
+}
+
+/** The exam equivalent of planCallCounts. See that comment. */
+const examCallCounts = new Map();
+
 /**
  * The embeddings envelope for a `:batchEmbedContents` request.
  *
@@ -493,12 +753,19 @@ globalThis.fetch = async function patchedFetch(input, init) {
     return upstreamError();
   }
 
-  // Checked before the chat marker only for readability; the two markers are
+  // Checked before the chat marker only for readability; the markers are
   // fields of different schemas and cannot both be present.
   if (isStudyPlanRequest(init)) {
     const planMode = process.env.FAKE_PLAN_MODE || "valid";
     return jsonResponse(
       geminiEnvelope(planBodyForMode(planMode, parseBody(init))),
+    );
+  }
+
+  if (isExamRequest(init)) {
+    const examMode = process.env.FAKE_EXAM_MODE || "valid";
+    return jsonResponse(
+      geminiEnvelope(examBodyForMode(examMode, parseBody(init))),
     );
   }
 

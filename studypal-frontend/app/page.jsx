@@ -1051,21 +1051,43 @@ export default function Home() {
               StudyPal
             </span>
           </div>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              background: "var(--bg3)",
-              border: "1px solid var(--border)",
-              borderRadius: 100,
-              padding: "5px 12px",
-              fontSize: "0.8rem",
-              color: "var(--muted)",
-            }}
-          >
-            👤&nbsp;
-            <strong style={{ color: "var(--cream)" }}>{username}</strong>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {/* SP-V2-006 §17: the exam flow is a separate route, linked here so
+                it is reachable. The chat page itself is untouched by that ticket. */}
+            <a
+              href="/exam"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                background: "var(--bg3)",
+                border: "1px solid var(--border)",
+                borderRadius: 100,
+                padding: "5px 12px",
+                fontSize: "0.8rem",
+                color: "var(--gold)",
+                textDecoration: "none",
+                whiteSpace: "nowrap",
+              }}
+            >
+              📝&nbsp;Exams
+            </a>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: "var(--bg3)",
+                border: "1px solid var(--border)",
+                borderRadius: 100,
+                padding: "5px 12px",
+                fontSize: "0.8rem",
+                color: "var(--muted)",
+              }}
+            >
+              👤&nbsp;
+              <strong style={{ color: "var(--cream)" }}>{username}</strong>
+            </div>
           </div>
         </header>
 
