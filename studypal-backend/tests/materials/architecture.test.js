@@ -768,7 +768,7 @@ describe("§45, §46 no deferred infrastructure crept in", () => {
 });
 
 describe("§19 /api/ask is untouched by the material pipeline", () => {
-  it("only the two modules allowed to may import a material module", async () => {
+  it("only the modules allowed to may import a material module", async () => {
     // The direction of the dependency is the whole of §19's protection. Materials
     // may not reach into /api/ask's behaviour, and /api/ask must not start
     // depending on materials — "do not make /api/ask depend on material IDs yet".
@@ -789,10 +789,22 @@ describe("§19 /api/ask is untouched by the material pipeline", () => {
       .map(([file]) => file);
 
     // Exact rather than empty, and self-anchoring in both directions: a new
-    // importer fails here, and so does either of these two ceasing to import,
-    // which would mean the reuse SP-V2-005 §15 requires had been replaced by a
-    // second copy of retrieval.
+    // importer fails here, and so does any of these ceasing to import, which
+    // would mean the reuse SP-V2-005 §15 and SP-V2-006 §14 require had been
+    // replaced by a second copy of retrieval.
+    //
+    // IN PATH ORDER, because that is the order readAll produces: jsFiles sorts,
+    // and readAll preserves it. A correct entry in the wrong position fails
+    // exactly as loudly as a wrong one, which is a confusing way to learn this.
     assert.deepEqual(importers, [
+      // SP-V2-006 §14: "Do not implement a new vector-search system here. Reuse
+      // SP-V2-004." The same reuse as the study-plan entry below, for the same
+      // reason, with a different query: an exam has no typed question, so this
+      // module composes one from the subject and topics and retrieves per
+      // material. It reaches for the repository, the retrieval service and the
+      // context builder, and adds no similarity SQL of its own.
+      // tests/exams/architecture.test.js holds that boundary from the other side.
+      "src/exams/material-brief.js",
       // The route table must mount the router; that is how the feature is reachable.
       "src/routes/index.js",
       // SP-V2-005 §15: "do not turn the study-plan generator into a second RAG

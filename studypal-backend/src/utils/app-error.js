@@ -40,6 +40,17 @@ export const badRequest = (message, options) =>
  */
 export const notFound = (message, options) => new AppError(404, message, options);
 
+/**
+ * 409 — the request is well-formed, but conflicts with the resource's state.
+ *
+ * Added by SP-V2-006 for one case: submitting an attempt that has already been
+ * submitted. The distinction from 400 is worth keeping precise — the request is
+ * not malformed and would have succeeded a moment earlier, so retrying it
+ * unchanged will never help. A submitted attempt is immutable, and the original
+ * result is returned by GET rather than overwritten by a second POST.
+ */
+export const conflict = (message, options) => new AppError(409, message, options);
+
 /** 413 — the request or an upload exceeded a configured limit. */
 export const payloadTooLarge = (message, options) =>
   new AppError(413, message, options);

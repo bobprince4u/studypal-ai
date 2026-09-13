@@ -87,7 +87,15 @@ describe("migrate() on a fresh database", () => {
     // extra table would otherwise pass. study_plan_tasks and study_plans were
     // added by 004 in SP-V2-005, and the ticket that adds the next table has to
     // come back here and say so — which is the point of the list being exact.
+    //
+    // SP-V2-006 is a ticket that came back and said so: 005 adds the four exam
+    // tables, which 001, 002 and 004 had each named as reserved. learning_events
+    // is still reserved, and is still deliberately absent.
     assert.deepEqual(await tableNames(pool), [
+      "attempt_answers",
+      "exam_attempts",
+      "exam_questions",
+      "exams",
       "material_chunks",
       "materials",
       "questions",

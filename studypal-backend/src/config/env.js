@@ -126,6 +126,20 @@ const MIGRATED_EMBEDDING_DIMENSIONS = 1536;
 const PLAN_DB_MAX_DAILY_MINUTES = 1440;
 const PLAN_DB_MAX_TEXT_CHARS = 200;
 
+/**
+ * The same, for SP-V2-006's exam tables.
+ *
+ * EXAM_DB_MAX_QUESTION_COUNT is exams_question_count_bounded,
+ * EXAM_DB_MAX_TEXT_CHARS is exams_subject_bounded and exams_title_bounded, and
+ * EXAM_DB_MAX_QUESTION_CHARS is exam_questions_text_bounded and
+ * exam_questions_explanation_bounded — all in
+ * migrations/postgres/005_exams.sql. A configuration above any of them means an
+ * exam that validates, costs a Gemini call, and then fails on INSERT.
+ */
+const EXAM_DB_MAX_QUESTION_COUNT = 100;
+const EXAM_DB_MAX_TEXT_CHARS = 200;
+const EXAM_DB_MAX_QUESTION_CHARS = 2000;
+
 const nodeEnv = process.env.NODE_ENV || "development";
 
 // ── storage directory ─────────────────────────────────────────────────────────
@@ -540,6 +554,118 @@ export const config = Object.freeze({
     maxContextChars: int("STUDYPAL_PLAN_MAX_CONTEXT_CHARS", 6000),
   }),
 
+  /**
+   * AI-generated exams (SP-V2-006).
+   *
+   * Same arrangement as `plan` above, and for the same reason §10 gives about
+   * the pass threshold: "do not hardcode the threshold in multiple places".
+   * Every number the exam path uses to accept, refuse or grade lives here, so
+   * the grader, the validator and the tests all read one value.
+   *
+   * Retrieval settings are absent for the reason they are absent from `plan`: a
+   * material-grounded exam uses config.rag.topK and config.rag.similarityThreshold
+   * unchanged, because §14 is explicit that this feature must reuse SP-V2-004's
+   * retrieval rather than grow a second vector search.
+   */
+  exam: Object.freeze({
+    /**
+     * The percentage at or above which an attempt passes (§10).
+     *
+     * The single source of truth for pass/fail. src/exams/grader.js is the only
+     * module that reads it, every other layer reads the `passed` boolean the
+     * grader computed, and the value is stored on the attempt row — so changing
+     * this changes what FUTURE attempts mean and leaves past results as they
+     * were graded, which is the honest behaviour for a stored result.
+     *
+     * At-or-above, not above: 70 with a threshold of 70 passes.
+     */
+    passingPercentage: int("STUDYPAL_EXAM_PASSING_PERCENTAGE", 70),
+
+    /**
+     * Questions one exam may be asked to contain (§2's "configurable question
+     * count").
+     *
+     * The minimum is 1 because a zero-question exam is not an exam and the
+     * exams_question_count_positive CHECK refuses it anyway. The maximum bounds
+     * the work one POST commissions: every question is output tokens the model
+     * must generate in a single response, and a 500-question request is a way to
+     * make one HTTP call cost a lot of money and then time out. It also matches
+     * the exams_question_count_bounded CHECK, so validation refuses with a 400
+     * what the database would otherwise refuse with a 500.
+     */
+    minQuestions: int("STUDYPAL_EXAM_MIN_QUESTIONS", 1),
+    maxQuestions: int("STUDYPAL_EXAM_MAX_QUESTIONS", 50),
+
+    /** Questions generated when a request does not say. */
+    defaultQuestionCount: int("STUDYPAL_EXAM_DEFAULT_QUESTIONS", 10),
+
+    /**
+     * Topics one request may name. Same reasoning as plan.maxTopics: each topic
+     * is a line in the prompt the model must cover.
+     */
+    maxTopics: int("STUDYPAL_EXAM_MAX_TOPICS", 20),
+
+    /**
+     * Longest accepted subject, and longest accepted single topic.
+     *
+     * Matches the exams_subject_bounded and exams_title_bounded CHECK
+     * constraints in migrations/postgres/005_exams.sql. Raising this alone makes
+     * the API accept something the database then refuses — after Gemini has been
+     * called and paid for.
+     */
+    maxTextChars: int("STUDYPAL_EXAM_MAX_TEXT_CHARS", 200),
+
+    /**
+     * Longest accepted question text and explanation from the model.
+     *
+     * Applied to the RESPONSE, not the request, and it matches the
+     * exam_questions_text_bounded and exam_questions_explanation_bounded CHECKs.
+     * The validator refuses an over-long question rather than truncating it: a
+     * question cut off mid-sentence is unanswerable, and persisting one would
+     * mean a graded exam nobody can sit.
+     */
+    maxQuestionChars: int("STUDYPAL_EXAM_MAX_QUESTION_CHARS", 2000),
+
+    /**
+     * Materials one exam may be grounded in. Each costs an ownership check, a
+     * retrieval round trip and a share of the context budget.
+     */
+    maxMaterials: int("STUDYPAL_EXAM_MAX_MATERIALS", 10),
+
+    /**
+     * Characters of retrieved material context placed in one generation prompt.
+     *
+     * The same 6000 as the study-plan budget and for the same reason: the
+     * remainder of the prompt — the requested topics, the question-type rules,
+     * the response schema — is what should be steering the output, and whole
+     * documents must never be sent.
+     */
+    maxContextChars: int("STUDYPAL_EXAM_MAX_CONTEXT_CHARS", 6000),
+
+    /**
+     * Extra generation attempts when the model's response is unusable (§8).
+     *
+     * SP-V2-005 fixed this at one retry in a module constant; §8 asks for the
+     * exam equivalent to be a choice ("either retry using the existing AI retry
+     * abstraction or return a controlled error — never persist an incomplete
+     * exam"), so it is configurable here and defaults to the same behaviour: two
+     * attempts in total.
+     *
+     * It covers every way a SUCCESSFUL call can produce content the validator
+     * refuses — malformed structure, an unsupported type, an invalid
+     * correctAnswer, and §8's wrong question count. All of them are sampling
+     * outcomes that a second call often fixes.
+     *
+     * It does NOT cover a provider FAILURE. A 503, a timeout or an auth
+     * rejection will be the same the second time, and retrying turns one outage
+     * into two calls per request; src/exams/exam-generator.js therefore throws
+     * on the first provider error, exactly as the study-plan generator does.
+     * Setting this to a large number cannot cause a retry storm against a failing
+     * provider — only against a model that keeps answering badly.
+     */
+    generationRetries: int("STUDYPAL_EXAM_GENERATION_RETRIES", 1),
+  }),
+
   limits: Object.freeze({
     /** Express default was 100kb; preserved so the 413 boundary is unchanged. */
     jsonBody: process.env.JSON_BODY_LIMIT || "100kb",
@@ -648,8 +774,60 @@ export function configWarnings() {
     );
   }
 
-  if (config.cors.allowAll) {
+  if (config.exam.passingPercentage > 100) {
     warnings.push(
+      `STUDYPAL_EXAM_PASSING_PERCENTAGE=${config.exam.passingPercentage} is above 100, ` +
+        "so no attempt can ever pass — every result will be `passed: false` " +
+        "regardless of score.",
+    );
+  }
+
+  if (config.exam.minQuestions > config.exam.maxQuestions) {
+    warnings.push(
+      `STUDYPAL_EXAM_MIN_QUESTIONS=${config.exam.minQuestions} exceeds ` +
+        `STUDYPAL_EXAM_MAX_QUESTIONS=${config.exam.maxQuestions}, so no question ` +
+        "count can satisfy both and POST /api/exams will reject every request " +
+        "with a 400.",
+    );
+  }
+
+  if (
+    config.exam.defaultQuestionCount < config.exam.minQuestions ||
+    config.exam.defaultQuestionCount > config.exam.maxQuestions
+  ) {
+    warnings.push(
+      `STUDYPAL_EXAM_DEFAULT_QUESTIONS=${config.exam.defaultQuestionCount} is outside ` +
+        `the accepted range ${config.exam.minQuestions}-${config.exam.maxQuestions}, so a ` +
+        "request that omits questionCount is rejected by the validator that " +
+        "supplied the default.",
+    );
+  }
+
+  if (config.exam.maxQuestions > EXAM_DB_MAX_QUESTION_COUNT) {
+    warnings.push(
+      `STUDYPAL_EXAM_MAX_QUESTIONS=${config.exam.maxQuestions} is above the ` +
+        `exams_question_count_bounded CHECK (${EXAM_DB_MAX_QUESTION_COUNT}). An accepted ` +
+        "request fails on INSERT, after Gemini has already been called and paid for.",
+    );
+  }
+
+  if (config.exam.maxTextChars > EXAM_DB_MAX_TEXT_CHARS) {
+    warnings.push(
+      `STUDYPAL_EXAM_MAX_TEXT_CHARS=${config.exam.maxTextChars} is above the ` +
+        `exams_subject_bounded CHECK (${EXAM_DB_MAX_TEXT_CHARS}). An accepted subject ` +
+        "or topic fails on INSERT, after the generation has been paid for.",
+    );
+  }
+
+  if (config.exam.maxQuestionChars > EXAM_DB_MAX_QUESTION_CHARS) {
+    warnings.push(
+      `STUDYPAL_EXAM_MAX_QUESTION_CHARS=${config.exam.maxQuestionChars} is above the ` +
+        `exam_questions_text_bounded CHECK (${EXAM_DB_MAX_QUESTION_CHARS}). A question ` +
+        "the validator accepts fails on INSERT, rolling back the whole exam.",
+    );
+  }
+
+  if (config.cors.allowAll) {    warnings.push(
       "CORS is open to all origins. Set FRONTEND_URL or CORS_ORIGINS " +
         "(comma-separated) to restrict it.",
     );
