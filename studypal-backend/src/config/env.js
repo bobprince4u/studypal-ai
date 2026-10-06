@@ -666,6 +666,87 @@ export const config = Object.freeze({
     generationRetries: int("STUDYPAL_EXAM_GENERATION_RETRIES", 1),
   }),
 
+  /**
+   * SP-V2-007 — learning analytics.
+   *
+   * §9 asks for "named constants" for the weak-area rule. They live here rather
+   * than in the module for the reason §10 of SP-V2-006 gives about the pass
+   * threshold: a number that decides an outcome should have exactly one
+   * definition, and a deployment should be able to move it without a code
+   * change. src/analytics/analytics.metrics.js is the only module that reads
+   * these; every other layer consumes what it returns.
+   *
+   * NOTHING HERE CHANGES STORED DATA. Analytics is read-only (§CRITICAL
+   * ARCHITECTURAL RULE), so lowering the weak-area threshold reclassifies what
+   * the next request reports and rewrites nothing — unlike
+   * `exam.passingPercentage`, whose effect is frozen into each attempt row at
+   * submission. That asymmetry is why these can be tuned freely and that one
+   * cannot.
+   */
+  analytics: Object.freeze({
+    /**
+     * §9's evidence floor: the fewest answered questions a topic needs before
+     * it may be called weak.
+     *
+     * Three is the specified default, and the reason to have a floor at all is
+     * that accuracy over one or two questions is noise — a single unlucky
+     * guess would otherwise brand a topic at 0%. Raising this makes the
+     * weak-area list shorter and better evidenced; lowering it to 1 would make
+     * every missed question a weakness.
+     */
+    minTopicAttempts: Math.max(3, int("STUDYPAL_ANALYTICS_MIN_TOPIC_ATTEMPTS", 3)),
+
+    /**
+     * §9's accuracy threshold, as a percentage.
+     *
+     * STRICTLY below this counts as weak: 59.99 is weak, exactly 60 is not.
+     * The comparison is `<` in one place (src/analytics/analytics.metrics.js)
+     * and §22's test matrix pins all three sides of it.
+     */
+    weakTopicAccuracyThreshold: Math.max(0, Math.min(100, int(
+      "STUDYPAL_ANALYTICS_WEAK_ACCURACY_THRESHOLD",
+      60,
+    ))),
+
+    /**
+     * §5's history size, and the ceiling a client may ask for.
+     *
+     * `historyLimit` is what an unqualified request returns; `maxHistoryLimit`
+     * is the clamp on `?limit=`. §5 is explicit that the limit must not be
+     * unbounded and client-controlled: a validated, clamped parameter is the
+     * middle position between ignoring the client and letting one request ask
+     * for every attempt a user has ever made.
+     */
+    historyLimit: Math.max(1, Math.min(50, int("STUDYPAL_ANALYTICS_HISTORY_LIMIT", 10))),
+    maxHistoryLimit: Math.max(1, Math.min(50, int("STUDYPAL_ANALYTICS_MAX_HISTORY_LIMIT", 50))),
+
+    /**
+     * §6's trend windows, in completed attempts.
+     *
+     * `trendWindow` is the largest window compared; `minTrendWindow` is the
+     * smallest window that may be compared at all. Two, not one, because §6
+     * says "do not infer a trend from one attempt" — so a user needs at least
+     * four completed attempts before a direction is reported.
+     *
+     * The windows are always EQUAL in size (see compareRecentPerformance): the
+     * implementation shrinks both rather than comparing a five-attempt average
+     * against a one-attempt average, which would be arithmetic dressed up as a
+     * comparison.
+     */
+    trendWindow: Math.max(2, Math.min(50, int("STUDYPAL_ANALYTICS_TREND_WINDOW", 5))),
+    minTrendWindow: Math.max(2, int("STUDYPAL_ANALYTICS_MIN_TREND_WINDOW", 2)),
+
+    /**
+     * Rows returned by the topic and material breakdowns.
+     *
+     * A bound rather than a page, because these are aggregates over one user's
+     * own history and the realistic count is tens. It exists so a user with an
+     * unusual amount of data cannot make one request build an unbounded
+     * response, not because pagination is expected.
+     */
+    breakdownLimit: int("STUDYPAL_ANALYTICS_BREAKDOWN_LIMIT", 100),
+  }),
+
   limits: Object.freeze({
     /** Express default was 100kb; preserved so the 413 boundary is unchanged. */
     jsonBody: process.env.JSON_BODY_LIMIT || "100kb",
@@ -824,6 +905,54 @@ export function configWarnings() {
       `STUDYPAL_EXAM_MAX_QUESTION_CHARS=${config.exam.maxQuestionChars} is above the ` +
         `exam_questions_text_bounded CHECK (${EXAM_DB_MAX_QUESTION_CHARS}). A question ` +
         "the validator accepts fails on INSERT, rolling back the whole exam.",
+    );
+  }
+
+  // ── SP-V2-007 analytics ──
+  //
+  // None of these can corrupt stored data — analytics only reads — so each
+  // warns about a REPORT that would be misleading rather than about a write
+  // that would fail.
+
+  if (config.analytics.minTopicAttempts < 1) {
+    warnings.push(
+      `STUDYPAL_ANALYTICS_MIN_TOPIC_ATTEMPTS=${config.analytics.minTopicAttempts} is ` +
+        "below 1, so a topic with no answered questions would qualify as weak. " +
+        "SP-V2-007 §9 requires an evidence floor of at least one attempt.",
+    );
+  }
+
+  if (
+    config.analytics.weakTopicAccuracyThreshold < 0 ||
+    config.analytics.weakTopicAccuracyThreshold > 100
+  ) {
+    warnings.push(
+      `STUDYPAL_ANALYTICS_WEAK_ACCURACY_THRESHOLD=${config.analytics.weakTopicAccuracyThreshold} ` +
+        "is outside 0-100. Accuracy is a percentage, so a threshold outside that " +
+        "range makes every topic weak or none of them.",
+    );
+  }
+
+  if (config.analytics.historyLimit > config.analytics.maxHistoryLimit) {
+    warnings.push(
+      `STUDYPAL_ANALYTICS_HISTORY_LIMIT=${config.analytics.historyLimit} exceeds ` +
+        `STUDYPAL_ANALYTICS_MAX_HISTORY_LIMIT=${config.analytics.maxHistoryLimit}, so the ` +
+        "default history is larger than the largest value a client may ask for.",
+    );
+  }
+
+  if (config.analytics.minTrendWindow < 2) {
+    warnings.push(
+      `STUDYPAL_ANALYTICS_MIN_TREND_WINDOW=${config.analytics.minTrendWindow} is below 2. ` +
+        "SP-V2-007 §6 is explicit that a trend must not be inferred from one attempt.",
+    );
+  }
+
+  if (config.analytics.trendWindow < config.analytics.minTrendWindow) {
+    warnings.push(
+      `STUDYPAL_ANALYTICS_TREND_WINDOW=${config.analytics.trendWindow} is below ` +
+        `STUDYPAL_ANALYTICS_MIN_TREND_WINDOW=${config.analytics.minTrendWindow}, so no window ` +
+        "size satisfies both and a trend can never be reported.",
     );
   }
 

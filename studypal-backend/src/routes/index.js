@@ -25,6 +25,11 @@ import { studyPlanRoutes } from "../study-plans/study-plan.routes.js";
 // particular is reachable from nowhere else, which is what makes "Gemini does
 // not calculate scores" checkable rather than merely intended.
 import { examRoutes } from "../exams/exam.routes.js";
+// And again, read-only this time: SP-V2-007 keeps routes, controller, service,
+// repository, metrics, serializers and validation behind src/analytics/. That
+// folder contains no write of any kind, which is what makes "analytics never
+// modifies learning data" checkable rather than merely intended.
+import { analyticsRoutes } from "../analytics/analytics.routes.js";
 
 export const routes = Router();
 
@@ -34,3 +39,8 @@ routes.use("/api", questionRoutes);
 routes.use("/api", materialRoutes);
 routes.use("/api", studyPlanRoutes);
 routes.use("/api", examRoutes);
+// Mounted last, and the order matters for once: analytics reads what every
+// feature above it wrote, so a route collision would mean analytics had claimed
+// a path one of them owns. There is none — every path here begins /api/analytics
+// — and mounting it last makes that the easy thing to keep true.
+routes.use("/api", analyticsRoutes);

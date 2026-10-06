@@ -1052,6 +1052,7 @@ export default function Home() {
             </span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <a href="/analytics" style={{ color: "var(--gold)", fontSize: "0.8rem" }}>Analytics</a>
             {/* SP-V2-006 §17: the exam flow is a separate route, linked here so
                 it is reachable. The chat page itself is untouched by that ticket. */}
             <a
