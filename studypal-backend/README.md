@@ -728,3 +728,11 @@ and what is knowingly deferred.
   server warns about this at startup when the key is missing.
 - `SIGTERM` is handled: the listener stops, in-flight requests drain, the
   connection pool closes.
+
+### Learning analytics (SP-V2-007)
+
+Read-only learning analytics is available at `GET /api/analytics?username=…`,
+with `/exams`, `/topics`, `/weak-areas`, `/materials` and `/study-plans/:id`
+under that prefix. The frontend `/analytics` page consumes these DTOs.
+See [learning analytics architecture](docs/learning-analytics-architecture.md)
+for metric definitions, topic-attribution limitations, ownership and limits.
