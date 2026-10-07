@@ -36,7 +36,7 @@ import * as materialChatService from "./material-chat.service.js";
  */
 export async function chat(req, res) {
   const { answer, sources } = await materialChatService.answerFromMaterials({
-    username: req.validated.username,
+    userId: req.user.id,
     question: req.validated.question,
     materialId: req.validated.materialId,
     topK: req.validated.topK,

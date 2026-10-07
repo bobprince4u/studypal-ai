@@ -1,3 +1,5 @@
+import { authRoutes } from "../auth/auth.routes.js";
+import { requireAuthentication, csrfProtection } from "../auth/auth.middleware.js";
 /**
  * Route table.
  *
@@ -34,6 +36,9 @@ import { analyticsRoutes } from "../analytics/analytics.routes.js";
 export const routes = Router();
 
 routes.use("/", healthRoutes);
+routes.use("/api", csrfProtection);
+routes.use("/api/auth", authRoutes);
+routes.use("/api", requireAuthentication);
 routes.use("/api", sessionRoutes);
 routes.use("/api", questionRoutes);
 routes.use("/api", materialRoutes);

@@ -1,3 +1,4 @@
+// SP-V2-008: ownership is scoped by the authenticated immutable users.id.
 /**
  * Material chat: a question about a student's own documents, answered from them.
  *
@@ -31,7 +32,7 @@
 
 import { config } from "../config/env.js";
 import { logger } from "../utils/logger.js";
-import * as users from "../repositories/user.repository.js";
+import { assertUserId } from "../auth/identity.js";
 import { internal, notFound } from "../utils/app-error.js";
 import { generateJsonContent } from "../ai/gemini.client.js";
 import {
@@ -67,53 +68,22 @@ function noEvidence() {
  * Answer a question from the student's own materials.
  *
  * @param {object} input
- * @param {string} input.username unauthenticated claim; see the S1 note below
+ * @param {number} input.userId authenticated immutable user ID
  * @param {string} input.question already validated for presence and length
  * @param {number|null} [input.materialId] optional single-material scope
  * @param {number} [input.topK] a hint, clamped server-side
  * @returns {Promise<{answer: string, sources: Array<object>, grounded: boolean}>}
- * @throws {AppError} 404 when the username or the scoped material is unknown or
+ * @throws {AppError} 404 when the userId or the scoped material is unknown or
  *   not theirs; 500 when a provider call fails
  */
 export async function answerFromMaterials({
-  username,
+  userId,
   question,
   materialId = null,
   topK,
 }) {
-  // Resolved server-side from the username, exactly as every other material
-  // endpoint does. The request never supplies a user id — §16's "do not trust
-  // client-provided user IDs" is kept by there being no parameter for one.
-  //
-  // A read path, so it does not create the user (unlike upload). An unknown
-  // username is treated as a student with nothing uploaded — NOT as a 404 —
-  // whenever the request does not name a material, which is the same choice
-  // listMaterials makes: "this user has nothing" and "this user does not exist"
-  // are the same answer to a client that cannot authenticate anyway. Two
-  // consequences make it the right one here. It is true: there is no indexed
-  // chunk behind that username, which is exactly what the no-evidence answer
-  // says. And it removes an oracle — 404ing an unknown username while answering
-  // 200 for a known one with no uploads would make the status code report whether
-  // a username exists, which is precisely what a 404 was supposed to avoid.
-  //
-  // A request that DOES name a materialId keeps the 404, below: the caller named
-  // an id, and "unknown, or not yours" is one answer for both, matching
-  // getMaterial. That is where the 404 belongs, and it means only that.
-  //
-  // THE LIMITATION, STATED WHERE IT APPLIES: `username` is a claim, not a
-  // credential. Anyone who knows a student's username can ask questions of that
-  // student's documents through this endpoint and read passages of them back in
-  // the answer. The isolation below is real — student A cannot reach student B's
-  // chunks — but it isolates *claimed* identities. That is S1 in
-  // docs/security-baseline.md, unchanged by this ticket (§16: do not implement
-  // authentication here), and it is why this endpoint is not fit for real
-  // student data yet.
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) {
-    if (materialId !== null) throw notFoundMaterial();
-    logger.info("material chat: unknown username, answering as an empty corpus");
-    return noEvidence();
-  }
+  // This ID comes from the authenticated principal, never a client claim.
+  assertUserId(userId);
 
   // Checked BEFORE retrieval when the request scopes to one material, so a
   // request naming someone else's material gets a 404 rather than a successful
@@ -271,8 +241,7 @@ function parseChatResponse(raw) {
  *
  * Same message and same reasoning as material.service.js: one answer for "no such
  * user", "no such material" and "someone else's material", because
- * distinguishing them would tell an unauthenticated caller which ids and
- * usernames are real.
+ * distinguishing them would tell a caller which material ids are real.
  */
 function notFoundMaterial() {
   return notFound("Material not found.");

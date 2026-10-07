@@ -5,13 +5,13 @@ a text file — and gets back a short explanation, two practice questions with
 model answers, and a line of encouragement. Each exchange is saved, so a student
 can see what they have asked and which topics they keep coming back to.
 
-Answers come from Google Gemini. Data lives in a local SQLite file.
+Answers come from Google Gemini. PostgreSQL stores authoritative application data, including authenticated identities and sessions.
 
 ## Project structure
 
 ```
 studypal-frontend/            ← repository root
-├── studypal-backend/         ← Express 5 API + SQLite  (port 4000)
+├── studypal-backend/         ← Express 5 API + PostgreSQL  (port 4000)
 └── studypal-frontend/        ← Next.js 16 UI           (port 3000)
 ```
 
@@ -87,12 +87,12 @@ The frontend has no test suite; `npm run build` type-checks and compiles it.
 
 Worth knowing before deploying this anywhere real:
 
-- **No authentication.** A username is an unverified string. Anyone who knows or
-  guesses one can read that student's history.
-- **No rate limiting.** `POST /api/ask` bills a Gemini call per request, with no
-  ceiling and no login required.
-- **Single instance only.** SQLite runs in-process, so the backend does not scale
-  horizontally as it stands.
+- **Authentication is required.** PostgreSQL-backed sessions enforce account ownership.
+  Existing accounts require operator-provisioned credentials; see the
+  [authentication architecture](./studypal-backend/docs/authentication-architecture.md).
+- **AI operations have per-user request rate limits.** Provider-spend and billing quotas remain a deployment concern.
+- **Uploaded files use local storage.** PostgreSQL stores identities and sessions;
+  multiple backend instances need shared document storage.
 - **Questions and uploaded documents are sent to Google.** Students are not told
   this anywhere in the UI.
 

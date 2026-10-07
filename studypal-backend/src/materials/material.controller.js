@@ -25,7 +25,7 @@ import * as materialService from "./material.service.js";
  */
 export async function upload(req, res) {
   const material = await materialService.uploadMaterial({
-    username: req.validated.username,
+    userId: req.user.id,
     file: req.file,
   });
   res.status(201).json(material);
@@ -33,7 +33,7 @@ export async function upload(req, res) {
 
 /** GET /api/materials?username=… — that user's materials, newest first. */
 export async function list(req, res) {
-  res.json(await materialService.listMaterials(req.validated.username));
+  res.json(await materialService.listMaterials(req.user.id));
 }
 
 /** GET /api/materials/:id?username=… — one material's metadata. */
@@ -41,7 +41,7 @@ export async function get(req, res) {
   res.json(
     await materialService.getMaterial({
       id: req.validated.id,
-      username: req.validated.username,
+      userId: req.user.id,
     }),
   );
 }
@@ -51,7 +51,7 @@ export async function status(req, res) {
   res.json(
     await materialService.getMaterialStatus({
       id: req.validated.id,
-      username: req.validated.username,
+      userId: req.user.id,
     }),
   );
 }
@@ -72,7 +72,7 @@ export async function remove(req, res) {
   res.json(
     await materialService.deleteMaterial({
       id: req.validated.id,
-      username: req.validated.username,
+      userId: req.user.id,
     }),
   );
 }

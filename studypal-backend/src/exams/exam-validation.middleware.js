@@ -1,3 +1,6 @@
+// SP-V2-008: usernames below come from the authenticated principal.
+// Client claims are optional and may never select a different account.
+import { authenticatedUsername } from "../auth/auth.middleware.js";
 /**
  * Request validation for /api/exams and /api/exam-attempts.
  *
@@ -63,7 +66,7 @@ const MAX_ANSWER_CHARS = 100;
 export function validateCreateExamBody(req, _res, next) {
   // `?? {}` for the reason the material validators do it: with no body at all,
   // `req.body` is undefined and destructuring would turn a plain 400 into a 500.
-  const body = req.body ?? {};
+  const body = { ...req.body, username: authenticatedUsername(req, req.body?.username) };
 
   const username = readUsername(body.username);
   if (username === null) return next(badRequest("Username is required."));
@@ -108,7 +111,7 @@ export function validateCreateExamBody(req, _res, next) {
 
 /** Require a `username` query parameter — GET one exam, GET the history. */
 export function validateUsernameQuery(req, _res, next) {
-  const username = readUsername(req.query?.username);
+  const username = readUsername(authenticatedUsername(req, req.query?.username));
   if (username === null) return next(badRequest("Username is required."));
   if (username.length > config.limits.usernameLength) {
     return next(
@@ -129,7 +132,7 @@ export function validateUsernameQuery(req, _res, next) {
  * than in the query string, matching the study-plan writes.
  */
 export function validateUsernameBody(req, _res, next) {
-  const username = readUsername((req.body ?? {}).username);
+  const username = readUsername(authenticatedUsername(req, req.body?.username));
   if (username === null) return next(badRequest("Username is required."));
   if (username.length > config.limits.usernameLength) {
     return next(

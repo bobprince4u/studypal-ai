@@ -1,3 +1,4 @@
+import { expensiveOperationLimit } from "../auth/rate-limit.middleware.js";
 /**
  * The six exam endpoints (§9).
  *
@@ -91,7 +92,7 @@ examRoutes.post(
   asyncHandler(startAttempt),
 );
 
-examRoutes.post("/exams", validateCreateExamBody, asyncHandler(create));
+examRoutes.post("/exams", expensiveOperationLimit("exam"), validateCreateExamBody, asyncHandler(create));
 
 examRoutes.get(
   "/exams/:id/attempts/:attemptId",

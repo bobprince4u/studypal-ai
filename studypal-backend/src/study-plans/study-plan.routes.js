@@ -1,3 +1,4 @@
+import { expensiveOperationLimit } from "../auth/rate-limit.middleware.js";
 /**
  * The five study-plan endpoints (§26-§30).
  *
@@ -70,6 +71,7 @@ export const studyPlanRoutes = Router();
 
 studyPlanRoutes.post(
   "/study-plans/:id/regenerate",
+  expensiveOperationLimit("studyPlan"),
   validatePlanId,
   validateUsernameBody,
   asyncHandler(regenerate),
@@ -77,6 +79,7 @@ studyPlanRoutes.post(
 
 studyPlanRoutes.post(
   "/study-plans",
+  expensiveOperationLimit("studyPlan"),
   validateCreatePlanBody,
   asyncHandler(create),
 );

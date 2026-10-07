@@ -92,7 +92,7 @@ let server;
 let pool;
 
 before(async () => {
-  server = await startServer({ label: "plan-api" });
+  server = await startServer({ authenticatedFixtures: true, label: "plan-api" });
   pool = new pg.Pool({ connectionString: server.databaseUrl, max: 4 });
 });
 
@@ -426,7 +426,7 @@ describe("POST /api/study-plans rejects bad input (§10)", () => {
   it("requires a username, and does not echo what was sent", async () => {
     for (const value of [undefined, "", "   ", 42, null, ["a", "b"], { $ne: null }]) {
       const res = await createPlan(planBody("ignored", { username: value }));
-      assertJsonError(res, 400, "Username is required.");
+      assertJsonError(res, value === undefined ? 401 : 400, value === undefined ? "Authentication required." : "Username is required.");
     }
     // The rejection must not reflect the input back into the response body.
     const res = await createPlan(
@@ -627,21 +627,14 @@ describe("POST /api/study-plans rejects bad input (§10)", () => {
   it("rejects an empty body without crashing", async () => {
     // `req.body` is undefined here; destructuring it would turn a 400 into a 500.
     const res = await server.request("POST", "/api/study-plans", {});
-    assertJsonError(res, 400, "Username is required.");
+    assertJsonError(res, 401, "Authentication required.");
   });
-
-  it("does not create a user as a side effect of a plan request (§10)", async () => {
-    // Unlike /api/ask and /api/materials, these endpoints require a user that
-    // already exists — a plan is not someone's first interaction with StudyPal.
+  it("rejects an anonymous plan request without creating a user (§10)", async () => {
     const username = testUser("ghost");
-    const res = await createPlan(planBody(username));
-    assertJsonError(res, 404, "Study plan not found.");
-
-    const { rows } = await pool.query(
-      "SELECT COUNT(*) AS c FROM users WHERE username = $1",
-      [username],
-    );
-    assert.equal(rows[0].c, 0, "no user row may be created by a failed plan request");
+    const res = await server.request("POST", "/api/study-plans", { json: { subject: "Biology" } });
+    assertJsonError(res, 401, "Authentication required.");
+    const { rows } = await pool.query("SELECT COUNT(*) AS c FROM users WHERE username=$1", [username]);
+    assert.equal(rows[0].c, 0);
   });
 
   it("persists nothing when validation fails", async () => {
@@ -713,11 +706,11 @@ describe("GET /api/study-plans lists a learner's plans (§26)", () => {
     assert.deepEqual(res.body, []);
   });
 
-  it("requires a username", async () => {
+  it("requires an authenticated session", async () => {
     assertJsonError(
       await server.request("GET", "/api/study-plans"),
-      400,
-      "Username is required.",
+      401,
+      "Authentication required.",
     );
     assertJsonError(
       await server.request("GET", "/api/study-plans?username=%20%20"),
@@ -778,13 +771,13 @@ describe("GET /api/study-plans/:id returns one plan with its tasks (§27)", () =
     }
   });
 
-  it("requires a username", async () => {
+  it("requires an authenticated session", async () => {
     const username = await makeUser();
     const plan = await createPlanOk(username);
     assertJsonError(
       await server.request("GET", `/api/study-plans/${plan.id}`),
-      400,
-      "Username is required.",
+      401,
+      "Authentication required.",
     );
   });
 });
@@ -923,13 +916,13 @@ describe("PATCH task status, and the plan status derived from it (§28, §29)", 
     }
   });
 
-  it("requires a username in the body", async () => {
+  it("requires a authenticated session in the body", async () => {
     const username = await makeUser();
     const plan = await createPlanOk(username);
     assertJsonError(
       await patchTask(plan.id, plan.tasks[0].id, { status: "completed" }),
-      400,
-      "Username is required.",
+      401,
+      "Authentication required.",
     );
   });
 
@@ -1177,11 +1170,11 @@ describe("POST /api/study-plans/:id/regenerate never overwrites (§30)", () => {
     );
   });
 
-  it("requires a username, and 404s for a plan that is not the caller's", async () => {
+  it("requires authentication, and 404s for a plan that is not the caller's", async () => {
     const username = await makeUser();
     const plan = await createPlanOk(username);
 
-    assertJsonError(await regenerate(plan.id, {}), 400, "Username is required.");
+    assertJsonError(await regenerate(plan.id, {}), 401, "Authentication required.");
     assertJsonError(
       await regenerate(999_999_999, { username }),
       404,
@@ -1290,7 +1283,7 @@ describe("the endpoint surface is exactly five routes", () => {
   });
 
   it("answers unknown study-plan paths with JSON, not an HTML error page", async () => {
-    const res = await server.request("GET", "/api/study-plans/1/tasks");
+    const res = await server.request("GET", `/api/study-plans/1/tasks?username=${testUser("surface")}`);
     assert.equal(res.status, 404);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
   });

@@ -1,18 +1,21 @@
 "use client";
+import { apiFetch } from "../auth-client";
+import { useAuth } from "../auth-provider";
 
 import { useState } from "react";
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 const display = value => value === null ? "No data" : String(value);
 
 export default function AnalyticsPage() {
-  const [username, setUsername] = useState("");
+  const account = useAuth();
+  const username = account.username;
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [planId, setPlanId] = useState("");
   const [plan, setPlan] = useState(null);
   async function read(path, name) {
-    const response = await fetch(`${API}/api/analytics${path}?username=${encodeURIComponent(name)}`);
+    const response = await apiFetch(`${API}/api/analytics${path}`);
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || "Analytics could not be loaded.");
     return body;
@@ -40,7 +43,7 @@ export default function AnalyticsPage() {
     <h1>Learning analytics</h1>
     <p>Progress and performance from your recorded study activity.</p>
     <form onSubmit={load}>
-      <label>Username <input value={username} onChange={e => setUsername(e.target.value)} required maxLength={100} /></label>{" "}
+      <span>{username}</span>{" "}
       <button disabled={busy}>{busy ? "Loading…" : "View analytics"}</button>
     </form>
     {error && <p role="alert">{error}</p>}

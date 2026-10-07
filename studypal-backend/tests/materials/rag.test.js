@@ -52,7 +52,7 @@ const MAX_TOP_K = 20;
 let server;
 
 before(async () => {
-  server = await startServer({ label: "rag" });
+  server = await startServer({ authenticatedFixtures: true, label: "rag" });
 });
 
 after(async () => {
@@ -163,10 +163,10 @@ function assertCitationShape(source) {
 
 // ── §14, §39: what the endpoint refuses ─────────────────────────────────────
 describe("POST /api/materials/chat — request validation", () => {
-  it("rejects a missing username with 400", async () => {
+  it("rejects a missing username with 401", async () => {
     const res = await chat({ question: "How does photosynthesis work?" });
-    assertJsonError(res, 400);
-    assert.match(res.body.error, /username/i);
+    assertJsonError(res, 401);
+    assert.match(res.body.error, /authentication/i);
   });
 
   it("rejects a blank username with the same 400", async () => {
@@ -314,7 +314,7 @@ describe("POST /api/materials/chat — request validation", () => {
   });
 
   it("rejects a request with no body at all", async () => {
-    assertJsonError(await server.request("POST", "/api/materials/chat"), 400);
+    assertJsonError(await server.request("POST", "/api/materials/chat"), 401);
   });
 });
 
@@ -534,7 +534,7 @@ describe("POST /api/materials/chat — when nothing is relevant", () => {
     // EVERY generation request with a 500, so a 200 is only reachable if no
     // generation request was made. The same question against a healthy server
     // (above) proves the 200 is not an artifact of the outage.
-    const offline = await startServer({
+    const offline = await startServer({ authenticatedFixtures: true,
       label: "ragnogen",
       env: { FAKE_GEMINI_MODE: "http-error" },
     });
@@ -566,7 +566,7 @@ describe("POST /api/materials/chat — when nothing is relevant", () => {
 // ── §33: a provider failure is its own condition ────────────────────────────
 describe("POST /api/materials/chat — when a provider fails", () => {
   it("returns a safe JSON 500 when generation fails", async () => {
-    const offline = await startServer({
+    const offline = await startServer({ authenticatedFixtures: true,
       label: "ragnoai",
       env: { FAKE_GEMINI_MODE: "http-error" },
     });
@@ -601,7 +601,7 @@ describe("POST /api/materials/chat — when a provider fails", () => {
     // The subtler of the two, and the one §33 singles out: the search never ran,
     // so "nothing relevant was found" would be a claim about the student's
     // documents that this server is in no position to make.
-    const offline = await startServer({
+    const offline = await startServer({ authenticatedFixtures: true,
       label: "ragnoembed",
       env: { FAKE_EMBEDDING_MODE: "http-error" },
     });
@@ -633,7 +633,7 @@ describe("POST /api/materials/chat — when a provider fails", () => {
     // There, prose is a usable answer to a general question; here it is
     // ungrounded text from an endpoint that promises grounding, and there is no
     // honest way to attach sources to it.
-    const babbling = await startServer({
+    const babbling = await startServer({ authenticatedFixtures: true,
       label: "ragprose",
       env: { FAKE_CHAT_MODE: "prose" },
     });
@@ -656,7 +656,7 @@ describe("POST /api/materials/chat — when a provider fails", () => {
 // ── §22, §24: the citations are the backend's, whatever the model says ──────
 describe("POST /api/materials/chat — a model that cites badly", () => {
   it("returns no citation for a source the prompt never contained", async () => {
-    const lying = await startServer({
+    const lying = await startServer({ authenticatedFixtures: true,
       label: "ragbadcite",
       env: { FAKE_CHAT_MODE: "invalid-index" },
     });
@@ -681,7 +681,7 @@ describe("POST /api/materials/chat — a model that cites badly", () => {
   });
 
   it("cites every source it used, with each one's own metadata", async () => {
-    const citesAll = await startServer({
+    const citesAll = await startServer({ authenticatedFixtures: true,
       label: "ragallcite",
       env: { FAKE_CHAT_MODE: "all-sources" },
     });

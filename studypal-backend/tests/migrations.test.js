@@ -93,6 +93,8 @@ describe("migrate() on a fresh database", () => {
     // is still reserved, and is still deliberately absent.
     assert.deepEqual(await tableNames(pool), [
       "attempt_answers",
+      "auth_rate_limits",
+      "auth_sessions",
       "exam_attempts",
       "exam_questions",
       "exams",
@@ -298,7 +300,7 @@ describe("the app runs on a database created only by migrations", () => {
     const { startServer, askForm, testUser } = await import(
       "./helpers/server-harness.mjs"
     );
-    const server = await startServer({ label: "postmig" });
+    const server = await startServer({ authenticatedFixtures: true, label: "postmig" });
     cleanups.push(() => server.stop());
 
     const username = testUser("mig");

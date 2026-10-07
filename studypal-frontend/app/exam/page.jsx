@@ -1,4 +1,6 @@
 "use client";
+import { apiFetch } from "../auth-client";
+import { useAuth } from "../auth-provider";
 
 /**
  * SP-V2-006 — the minimum exam flow (§17).
@@ -71,7 +73,8 @@ const STEP = {
 export default function ExamPage() {
   const [step, setStep] = useState(STEP.signIn);
   const [username, setUsername] = useState("");
-  const [inputName, setInputName] = useState("");
+  const account = useAuth();
+  const inputName = account.username;
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -100,7 +103,7 @@ export default function ExamPage() {
 
   /** Read a response as JSON, turning any non-2xx into the same throw. */
   const send = useCallback(async (path, options) => {
-    const res = await fetch(`${API}${path}`, options);
+    const res = await apiFetch(`${API}${path}`, options);
     let body = null;
     try {
       body = await res.json();
@@ -122,14 +125,14 @@ export default function ExamPage() {
       const session = await send("/api/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: name }),
+        body: JSON.stringify({}),
       });
       setUsername(session.username);
       // Materials are optional — an exam on topics alone is first-class (§6) —
       // so a failure here must not block the screen.
       try {
         setMaterials(
-          await send(`/api/materials?username=${encodeURIComponent(session.username)}`),
+          await send("/api/materials"),
         );
       } catch {
         setMaterials([]);
@@ -151,7 +154,6 @@ export default function ExamPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username,
           subject: subject.trim(),
           topics: topics
             .split(",")
@@ -184,7 +186,7 @@ export default function ExamPage() {
       const started = await send(`/api/exams/${exam.id}/attempts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username }),
+        body: JSON.stringify({}),
       });
       setAttempt(started);
       setAnswers({});
@@ -212,13 +214,13 @@ export default function ExamPage() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, answers: payload }),
+          body: JSON.stringify({ answers: payload }),
         },
       );
       setResult(graded);
       setStep(STEP.result);
       try {
-        setHistory(await send(`/api/exam-attempts?username=${encodeURIComponent(username)}`));
+        setHistory(await send("/api/exam-attempts"));
       } catch {
         setHistory([]);
       }
@@ -321,17 +323,7 @@ export default function ExamPage() {
               server.
             </p>
             <ErrorNote />
-            <label style={label} htmlFor="exam-username">
-              Your name
-            </label>
-            <input
-              id="exam-username"
-              style={{ ...input, marginBottom: 18 }}
-              value={inputName}
-              onChange={(e) => setInputName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !busy && signIn()}
-              placeholder="e.g. prince"
-            />
+            <p>Signed in as {inputName}</p>
             <button style={primary} onClick={signIn} disabled={busy}>
               {busy ? "Signing in…" : "Continue"}
             </button>

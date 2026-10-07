@@ -1,48 +1,15 @@
+// SP-V2-008: ownership is scoped by the authenticated immutable users.id.
 /**
- * Analytics orchestration: resolve the learner, read, calculate, shape (§14).
- *
- * The layer between the controller and everything else. It touches no `req` and
- * no `res`, writes no SQL, and — unlike every other service in this codebase —
- * calls no provider, opens no transaction and performs no write. §1's
- * "Analytics is a READ-ONLY consumer of persisted learning data" is visible in
- * this file's import list: a repository, a pure calculation module, a DTO
- * module, and the user lookup. No `withTransaction`, no `gemini.client`, no
- * retrieval service, no embedding provider.
- *
- * WHY THERE ARE TWO NOT-FOUND BEHAVIOURS, AND WHICH APPLIES WHERE
- * ---------------------------------------------------------------
- * §11 says to preserve existing StudyPal not-found semantics, and StudyPal has
- * two — because it has two kinds of endpoint:
- *
- *   AGGREGATES OVER A LEARNER (the overview, the history, topics, weak areas,
- *   materials) answer 200 with the zero-data shape when the username is
- *   unknown. This matches src/services/question.service.js's getProgress, which
- *   returns `{total_questions: 0, topics: []}` rather than 404. The reasoning is
- *   the same: nothing is being looked up by name. "How did this learner do"
- *   over a learner with no rows is legitimately "no data", and an unknown
- *   username has no rows — so the two are the same answer, and giving them the
- *   same answer is the stronger §11 position. A 404 here would confirm to an
- *   unauthenticated caller which usernames exist.
- *
- *   A NAMED RESOURCE (GET /api/analytics/study-plans/:id) answers 404, matching
- *   src/study-plans/study-plan.service.js exactly. Absent plan, someone else's
- *   plan and unknown username are one message, so §11's "Do not leak whether
- *   another user's resource exists" holds — and it holds because
- *   findPlanProgress returns `undefined` for all three, not because this file
- *   remembers to conflate them.
- *
- * ZERO DATA GOES THROUGH THE SAME SERIALIZERS
- * -------------------------------------------
- * The empty responses below are built by handing zero-valued rows to the same
- * mappers that shape real ones, rather than by writing a second literal. §18
- * requires the no-data user to be handled everywhere; doing it this way means
- * the empty response cannot acquire a different set of keys than the populated
- * one, which is the failure mode a hand-written empty literal has.
+ * Read-only analytics for the authenticated immutable user ID.
+ * Repositories enforce owner filters; calculations and serializers retain the
+ * existing metrics and response shapes. Authenticated learners without evidence
+ * receive empty aggregates. A missing or foreign named plan receives 404.
+ * This service performs no user lookup, account creation or provider call.
  */
 
 import { config } from "../config/env.js";
 import { notFound } from "../utils/app-error.js";
-import * as users from "../repositories/user.repository.js";
+import { assertUserId } from "../auth/identity.js";
 import * as analyticsRepository from "./analytics.repository.js";
 import {
   byWeakness,
@@ -105,11 +72,11 @@ const NO_ATTEMPTS = Object.freeze({
  * comparison needs. The limit is derived from config, not from the request, so
  * a caller cannot change what the trend is computed over.
  *
- * @param {{username: string}} input
+ * @param {{userId: number}} input
  * @returns {Promise<object>}
  */
-export async function getOverview({ username }) {
-  const userId = await findUserId(username);
+export async function getOverview({ userId }) {
+  assertUserId(userId);
 
   if (userId === undefined) {
     return toOverviewShape({
@@ -151,19 +118,18 @@ export async function getOverview({ username }) {
  *
  * A BARE ARRAY, matching GET /api/exam-attempts, GET /api/materials,
  * GET /api/study-plans and GET /api/history. §12: follow the existing envelope
- * and do not create a second response style. An unknown username returns `[]`
+ * and do not create a second response style. An unknown userId returns `[]`
  * rather than 404 — see the header.
  *
  * `limit` arrives already validated and clamped by the middleware; this layer
  * neither re-clamps nor defaults it, so a route that forgot the middleware
  * fails a test rather than quietly working.
  *
- * @param {{username: string, limit: number}} input
+ * @param {{userId: number, limit: number}} input
  * @returns {Promise<Array<object>>}
  */
-export async function getExamHistory({ username, limit }) {
-  const userId = await findUserId(username);
-  if (userId === undefined) return [];
+export async function getExamHistory({ userId, limit }) {
+  assertUserId(userId);
 
   const rows = await analyticsRepository.findRecentCompletedAttempts(
     userId,
@@ -180,12 +146,11 @@ export async function getExamHistory({ username, limit }) {
  * re-sorting here: two sort definitions for one endpoint is how an ordering
  * becomes non-deterministic.
  *
- * @param {{username: string}} input
+ * @param {{userId: number}} input
  * @returns {Promise<Array<object>>}
  */
-export async function getTopicBreakdown({ username }) {
-  const userId = await findUserId(username);
-  if (userId === undefined) return [];
+export async function getTopicBreakdown({ userId }) {
+  assertUserId(userId);
 
   const rows = await analyticsRepository.findTopicBreakdown(userId);
   return rows.map(toTopicShape);
@@ -205,12 +170,11 @@ export async function getTopicBreakdown({ username }) {
  * analytics.metrics.js against `config.analytics`, so this file cannot apply a
  * different 60 than the one the tests pin.
  *
- * @param {{username: string}} input
+ * @param {{userId: number}} input
  * @returns {Promise<Array<object>>}
  */
-export async function getWeakAreas({ username }) {
-  const userId = await findUserId(username);
-  if (userId === undefined) return [];
+export async function getWeakAreas({ userId }) {
+  assertUserId(userId);
 
   const rows = await analyticsRepository.findTopicBreakdown(userId);
   const topics = rows.map(toTopicShape);
@@ -232,12 +196,11 @@ export async function getWeakAreas({ username }) {
  * they fit better; a bare-array collection under /api/analytics is that
  * convention.
  *
- * @param {{username: string}} input
+ * @param {{userId: number}} input
  * @returns {Promise<Array<object>>}
  */
-export async function getMaterialBreakdown({ username }) {
-  const userId = await findUserId(username);
-  if (userId === undefined) return [];
+export async function getMaterialBreakdown({ userId }) {
+  assertUserId(userId);
 
   const rows = await analyticsRepository.findMaterialBreakdown(userId);
   return rows.map(toMaterialShape);
@@ -259,14 +222,13 @@ export async function getMaterialBreakdown({ username }) {
  * work would not, and "we looked and then threw it away" is a weaker ownership
  * story than "we never looked".
  *
- * @param {{username: string, planId: number}} input
+ * @param {{userId: number, planId: number}} input
  * @returns {Promise<object>}
  */
-export async function getPlanProgress({ username, planId }) {
-  const userId = await findUserId(username);
-  // Unknown username and unknown plan give the same 404 as someone else's
+export async function getPlanProgress({ userId, planId }) {
+  assertUserId(userId);
+  // Unknown userId and unknown plan give the same 404 as someone else's
   // plan. §11: do not leak whether another user's resource exists.
-  if (userId === undefined) throw notFoundPlan();
 
   const plan = await analyticsRepository.findPlanProgress(planId, userId);
   if (plan === undefined) throw notFoundPlan();
@@ -280,7 +242,7 @@ export async function getPlanProgress({ username, planId }) {
 }
 
 /**
- * Resolve a username to a user id, or `undefined`.
+ * Resolve a userId to a user id, or `undefined`.
  *
  * Deliberately NOT `requireUserId`. The exam and study-plan services throw 404
  * here; analytics does not, because four of its five endpoints are aggregates
@@ -292,16 +254,14 @@ export async function getPlanProgress({ username, planId }) {
  * `users.upsert` — which POST /api/ask and POST /api/materials use — would be a
  * write performed by a GET.
  */
-async function findUserId(username) {
-  return users.findIdByUsername(username);
-}
+
 
 /**
  * The 404 the per-plan endpoint produces.
  *
  * One message for three situations — no such user, no such plan, someone
  * else's plan — for the reason src/exams/exam.service.js records about its own:
- * distinguishing them tells an unauthenticated caller which ids exist.
+ * distinguishing them tells a caller which ids exist.
  */
 function notFoundPlan() {
   return notFound("Study plan not found.");

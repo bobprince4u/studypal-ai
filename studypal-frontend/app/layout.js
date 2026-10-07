@@ -1,4 +1,5 @@
 import "./globals.css";
+import AuthProvider from "./auth-provider";
 
 export const metadata = {
   title: "StudyPal — AI Study Companion",
@@ -19,7 +20,7 @@ export default function RootLayout({ children }) {
           rel="stylesheet"
         />
       </head>
-      <body>{children}</body>
+      <body><AuthProvider>{children}</AuthProvider></body>
     </html>
   );
 }

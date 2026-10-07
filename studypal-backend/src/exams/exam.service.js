@@ -1,3 +1,4 @@
+// SP-V2-008: ownership is scoped by the authenticated immutable users.id.
 /**
  * Exam orchestration: ownership, generation, attempts and grading.
  *
@@ -42,7 +43,7 @@ import * as examRepository from "./exam.repository.js";
 import { buildExamMaterialContext, resolveMaterials } from "./material-brief.js";
 import { generateExam } from "./exam-generator.js";
 import { gradeAttempt } from "./grader.js";
-import * as users from "../repositories/user.repository.js";
+import { assertUserId } from "../auth/identity.js";
 
 /** Items returned by GET /api/exam-attempts. Shares the material list ceiling. */
 const ATTEMPT_LIST_LIMIT = config.limits.materialListItems;
@@ -54,7 +55,7 @@ const ATTEMPT_LIST_LIMIT = config.limits.materialListItems;
  * @returns {Promise<object>} the API shape, questions included, NO answer key
  */
 export async function createExam({
-  username,
+  userId,
   subject,
   topics,
   difficulty,
@@ -62,7 +63,7 @@ export async function createExam({
   questionTypes,
   materialIds,
 }) {
-  const userId = await requireUserId(username);
+  assertUserId(userId);
 
   // §6's ownership check, before any provider call. A request naming a material
   // the learner does not own is refused rather than quietly generating from the
@@ -134,8 +135,8 @@ export async function createExam({
  * @param {object} input
  * @returns {Promise<object>}
  */
-export async function getExam({ username, examId }) {
-  const userId = await requireUserId(username);
+export async function getExam({ userId, examId }) {
+  assertUserId(userId);
 
   const exam = await examRepository.findOwnedExamById(examId, userId);
   if (exam === undefined) throw notFoundExam();
@@ -150,8 +151,8 @@ export async function getExam({ username, examId }) {
  * @param {object} input
  * @returns {Promise<object>} the attempt, and the questions to answer
  */
-export async function startAttempt({ username, examId }) {
-  const userId = await requireUserId(username);
+export async function startAttempt({ userId, examId }) {
+  assertUserId(userId);
 
   const exam = await examRepository.findOwnedExamById(examId, userId);
   if (exam === undefined) throw notFoundExam();
@@ -194,8 +195,8 @@ export async function startAttempt({ username, examId }) {
  * @returns {Promise<object>} the graded result, answers and explanations now
  *   included — §9 permits them after submission
  */
-export async function submitAttempt({ username, examId, attemptId, answers }) {
-  const userId = await requireUserId(username);
+export async function submitAttempt({ userId, examId, attemptId, answers }) {
+  assertUserId(userId);
 
   const attempt = await examRepository.findOwnedAttempt({
     attemptId,
@@ -255,8 +256,8 @@ export async function submitAttempt({ username, examId, attemptId, answers }) {
  * @param {object} input
  * @returns {Promise<object>}
  */
-export async function getAttempt({ username, examId, attemptId }) {
-  const userId = await requireUserId(username);
+export async function getAttempt({ userId, examId, attemptId }) {
+  assertUserId(userId);
 
   const attempt = await examRepository.findOwnedAttempt({
     attemptId,
@@ -300,8 +301,8 @@ export async function getAttempt({ username, examId, attemptId }) {
  * @param {object} input
  * @returns {Promise<Array<object>>}
  */
-export async function listAttempts({ username }) {
-  const userId = await requireUserId(username);
+export async function listAttempts({ userId }) {
+  assertUserId(userId);
 
   const rows = await examRepository.findAttemptsByUserId(
     userId,
@@ -389,25 +390,21 @@ function resolveSource(sourceNumber, sources) {
 }
 
 /**
- * Resolve a username to a user id, or 404.
+ * Resolve a userId to a user id, or 404.
  *
  * Exam endpoints do not create users, matching the study-plan endpoints and
  * differing from POST /api/ask and POST /api/materials, which upsert. The
- * difference is deliberate: those endpoints are how a username comes into
+ * difference is deliberate: those endpoints are how a userId comes into
  * existence, and an exam is generated from a learner's subject and materials
  * rather than being someone's first interaction with the service.
  */
-async function requireUserId(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) throw notFoundExam();
-  return userId;
-}
+
 
 /**
  * The 404 every exam-level ownership failure produces.
  *
  * One message for three situations — no such user, no such exam, someone else's
- * exam — because distinguishing them would tell an unauthenticated caller which
+ * exam — because distinguishing them would tell a caller which
  * ids exist (§12, §15).
  */
 function notFoundExam() {

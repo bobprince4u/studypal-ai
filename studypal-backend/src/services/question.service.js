@@ -1,3 +1,4 @@
+// SP-V2-008: existing authenticated users only; no implicit account creation.
 /**
  * Question use cases: ask, history, progress.
  *
@@ -8,63 +9,27 @@
  */
 
 import * as questions from "../repositories/question.repository.js";
-import * as users from "../repositories/user.repository.js";
+import { assertUserId } from "../auth/identity.js";
 import { config } from "../config/env.js";
-import { withTransaction } from "../config/database.js";
 import { answerStudyQuestion } from "./ai.service.js";
 import { buildAttachmentParts } from "./upload.service.js";
 
-/**
- * Answer a study question and record it.
- *
- * The user row is created on demand. /api/ask has never required a prior
- * /api/session call and still does not; under the old schema `questions` simply
- * carried a username string, and with a foreign key the user has to exist first.
- *
- * The username is used VERBATIM, untrimmed — see src/middleware/validation.js.
- * `/api/session` trims, `/api/ask` does not, so "ann" and "ann " are two
- * different users. That asymmetry predates this iteration and the history
- * responses depend on it; it is recorded as debt rather than changed here.
- *
- * @param {object} input
- * @param {string} input.username stored verbatim
- * @param {string} input.question stored verbatim
- * @param {{originalname: string, buffer: Buffer}} [input.file]
- * @returns {Promise<object>} the answer object, returned to the client as-is
- */
-export async function askQuestion({ username, question, file }) {
+/** Answer for an authenticated user; persist only after successful generation. */
+export async function askQuestion({ userId, question, file }) {
+  assertUserId(userId);
   const attachmentParts = file ? await buildAttachmentParts(file) : [];
 
   // Before any write: a failed generation must leave the database untouched,
   // including leaving no empty user behind.
   const answer = await answerStudyQuestion({ question, attachmentParts });
 
-  // One of the few places a transaction is warranted. The upsert and the insert
-  // are two statements that must both land or neither: a committed user with no
-  // question is harmless but wrong, and a question needs its user's id to exist.
-  await withTransaction(async (client) => {
-    const { rows } = await client.query(
-      `INSERT INTO users (username)
-            VALUES ($1)
-       ON CONFLICT (username)
-       DO UPDATE SET username = EXCLUDED.username
-         RETURNING id`,
-      [username],
-    );
-
-    await questions.insert(
-      {
-        userId: rows[0].id,
-        question,
-        answer,
-        // The prompt forbids "General", but a malformed response may omit
-        // `topic` entirely; the column default is the same string.
-        topic: answer.topic || "Study Topic",
-        hasFile: Boolean(file),
-        filename: file ? file.originalname : null,
-      },
-      client,
-    );
+  await questions.insert({
+    userId,
+    question,
+    answer,
+    topic: answer.topic || "Study Topic",
+    hasFile: Boolean(file),
+    filename: file ? file.originalname : null,
   });
 
   return answer;
@@ -73,16 +38,15 @@ export async function askQuestion({ username, question, file }) {
 /**
  * Recent questions for a student, newest first.
  *
- * An unknown username yields an empty array rather than an error, and does not
- * create the user — reading a URL must not write a row.
+ * An authenticated learner without questions receives an empty array.
+ * Reading history never creates a user.
  *
- * @param {string} username
+ * @param {number} userId trusted immutable identity
  * @returns {Promise<Array<object>>} always an array; the frontend maps over it
  *   unguarded
  */
-export async function getHistory(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) return [];
+export async function getHistory(userId) {
+  assertUserId(userId);
 
   const rows = await questions.findRecentByUserId(
     userId,
@@ -105,16 +69,15 @@ export async function getHistory(username) {
 /**
  * Question count and top topics for a student.
  *
- * An unknown username is not an error: it yields zero and an empty list. The
+ * A learner without evidence receives zero and an empty list. The
  * frontend reads `progress.topics.length` without a guard, so `topics` must
  * always be an array.
  *
- * @param {string} username
+ * @param {number} userId trusted immutable identity
  * @returns {Promise<{total_questions: number, topics: Array<{topic: string, count: number}>}>}
  */
-export async function getProgress(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) return { total_questions: 0, topics: [] };
+export async function getProgress(userId) {
+  assertUserId(userId);
 
   // Two independent reads on the same user; issued together rather than in
   // sequence so the endpoint costs one round trip's latency, not two.

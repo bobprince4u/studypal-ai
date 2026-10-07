@@ -9,10 +9,10 @@
 import * as questionService from "../services/question.service.js";
 
 export async function ask(req, res) {
-  const { username, question } = req.validated;
+  const { question } = req.validated;
 
   const answer = await questionService.askQuestion({
-    username,
+    userId: req.user.id,
     question,
     file: req.file,
   });
@@ -24,9 +24,9 @@ export async function ask(req, res) {
 }
 
 export async function history(req, res) {
-  res.json(await questionService.getHistory(req.validated.username));
+  res.json(await questionService.getHistory(req.user.id));
 }
 
 export async function progress(req, res) {
-  res.json(await questionService.getProgress(req.validated.username));
+  res.json(await questionService.getProgress(req.user.id));
 }

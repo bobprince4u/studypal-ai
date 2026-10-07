@@ -1,3 +1,6 @@
+// SP-V2-008: usernames below come from the authenticated principal.
+// Client claims are optional and may never select a different account.
+import { authenticatedUsername } from "../auth/auth.middleware.js";
 /**
  * Request validation for /api/analytics.
  *
@@ -37,7 +40,7 @@ import { config } from "../config/env.js";
  * rather than a service-wide aggregate.
  */
 export function validateUsernameQuery(req, _res, next) {
-  const username = readUsername(req.query?.username);
+  const username = readUsername(authenticatedUsername(req, req.query?.username));
   if (username === null) return next(badRequest("Username is required."));
   if (username.includes("\0")) return next(badRequest("Username contains an invalid character."));
   if (username.length > config.limits.usernameLength) {
