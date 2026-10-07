@@ -1,3 +1,6 @@
+// SP-V2-008: usernames below come from the authenticated principal.
+// Client claims are optional and may never select a different account.
+import { authenticatedUsername } from "../auth/auth.middleware.js";
 /**
  * Request validation for /api/materials.
  *
@@ -34,7 +37,7 @@ import { badRequest } from "../utils/app-error.js";
  * @returns {string | null} the trimmed username, or null if absent/blank
  */
 function queryUsername(req) {
-  const raw = req.query?.username;
+  const raw = authenticatedUsername(req, req.query?.username);
   // Express parses `?username=a&username=b` into an ARRAY. Rejected rather than
   // taking the first: a repeated parameter is an ambiguous request, and quietly
   // picking one is how filter-bypass bugs start.
@@ -81,7 +84,7 @@ export function validateUploadBody(req, _res, next) {
   // body at all. Destructuring it directly would throw a TypeError and surface as
   // a 500 for what is plainly a 400 — the bug the existing validator's `body()`
   // helper exists to avoid.
-  const raw = (req.body ?? {}).username;
+  const raw = authenticatedUsername(req, (req.body ?? {}).username);
 
   if (typeof raw !== "string" || !raw.trim()) {
     return next(badRequest("Username is required."));
@@ -157,7 +160,7 @@ export function validateMaterialId(req, _res, next) {
 export function validateChatBody(req, _res, next) {
   // `?? {}` for the same reason validateUploadBody does it: with no body at all,
   // `req.body` is undefined and destructuring would be a 500 for a plain 400.
-  const body = req.body ?? {};
+  const body = { ...req.body, username: authenticatedUsername(req, req.body?.username) };
 
   if (typeof body.username !== "string" || !body.username.trim()) {
     return next(badRequest("Username is required."));

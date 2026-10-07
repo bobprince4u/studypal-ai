@@ -271,20 +271,22 @@ const sslConfig = sslEnabled
   ? Object.freeze({ rejectUnauthorized: sslRejectUnauthorized })
   : false;
 
-/**
- * Origins permitted by CORS.
- *
- * When this list is EMPTY the server keeps the pre-refactor behaviour of
- * reflecting any origin (`Access-Control-Allow-Origin: *`) and logs a warning
- * at startup. That default is deliberate: tightening CORS silently would break
- * whatever frontend deployment is currently live, and this iteration values
- * backward compatibility over architectural purity.
- */
+/** Explicit frontend origins. Development additionally allows loopback origins. */
 const corsOrigins = [
   ...new Set(
     [process.env.FRONTEND_URL?.trim(), ...list("CORS_ORIGINS")].filter(Boolean),
   ),
 ];
+
+function validProductionOrigin(origin) {
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === "https:" && parsed.origin === origin;
+  } catch { return false; }
+}
+if (nodeEnv === "production" && (!corsOrigins.length || corsOrigins.some(origin => !validProductionOrigin(origin)))) {
+  throw new Error("Production requires explicit HTTPS FRONTEND_URL / CORS_ORIGINS.");
+}
 
 export const config = Object.freeze({
   nodeEnv,
@@ -328,8 +330,20 @@ export const config = Object.freeze({
 
   cors: Object.freeze({
     origins: Object.freeze(corsOrigins),
-    /** No configured origins ⇒ permissive, as before. */
-    allowAll: corsOrigins.length === 0,
+    /** Wildcard credentialed CORS is never permitted. */
+    allowAll: false,
+  }),
+
+  rateLimits: Object.freeze({
+    windowSeconds: int("STUDYPAL_RATE_WINDOW_SECONDS", 900),
+    register: int("STUDYPAL_RATE_REGISTER_LIMIT", 10),
+    login: int("STUDYPAL_RATE_LOGIN_LIMIT", 20),
+    password: int("STUDYPAL_RATE_PASSWORD_LIMIT", 5),
+    upload: int("STUDYPAL_RATE_UPLOAD_LIMIT", 20),
+    chat: int("STUDYPAL_RATE_CHAT_LIMIT", 60),
+    studyPlan: int("STUDYPAL_RATE_STUDY_PLAN_LIMIT", 20),
+    exam: int("STUDYPAL_RATE_EXAM_LIMIT", 20),
+    ask: int("STUDYPAL_RATE_ASK_LIMIT", 60),
   }),
 
   ai: Object.freeze({
@@ -956,10 +970,8 @@ export function configWarnings() {
     );
   }
 
-  if (config.cors.allowAll) {    warnings.push(
-      "CORS is open to all origins. Set FRONTEND_URL or CORS_ORIGINS " +
-        "(comma-separated) to restrict it.",
-    );
+  if (!config.cors.origins.length) {
+    warnings.push("No production CORS origins configured; only development loopback origins are allowed.");
   }
 
   if (config.isProduction && !config.database.ssl) {

@@ -1,3 +1,5 @@
+> **SP-V2-008:** All feature APIs now require an authenticated session. Supplied usernames are optional compatibility claims and cannot select another account. See [authentication-architecture.md](authentication-architecture.md) for the current authentication contract and migration procedure. Historical anonymous-identity descriptions below are superseded.
+
 # StudyPal Security Baseline
 
 Established during **SP-V2-001** (baseline + backend architecture refactor).

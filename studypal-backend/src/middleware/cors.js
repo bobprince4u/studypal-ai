@@ -1,22 +1,4 @@
-/**
- * CORS policy.
- *
- * The pre-refactor server called bare `cors()`, which answers every origin with
- * `Access-Control-Allow-Origin: *`. For a deployed API that is too open, but
- * silently locking it down would break whichever frontend is currently live and
- * every developer running the UI on a port nobody wrote down.
- *
- * So the policy is explicit and opt-in:
- *
- *   FRONTEND_URL / CORS_ORIGINS set  →  only those origins are allowed
- *   neither set                      →  previous behaviour, plus a startup
- *                                       warning telling you to configure it
- *
- * Local development keeps working either way: the unconfigured default is
- * permissive, and DEV_ORIGINS below are always allowed outside production so
- * that setting FRONTEND_URL for a deployment does not lock a developer out of
- * their own machine.
- */
+/** Credentialed CORS: exact allowlist, plus development loopback origins. */
 
 import cors from "cors";
 
@@ -32,12 +14,9 @@ function isAllowed(origin) {
 }
 
 export function corsMiddleware() {
-  if (config.cors.allowAll) {
-    // Identical headers to the previous `cors()` call.
-    return cors({ origin: "*" });
-  }
-
   return cors({
+    credentials: true,
+    allowedHeaders: ["Content-Type", "X-StudyPal-Request"],
     origin(origin, callback) {
       // No Origin header at all: curl, server-to-server, health probes. These
       // are not browser cross-origin requests and there is nothing to allow.

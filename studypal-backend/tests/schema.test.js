@@ -449,6 +449,8 @@ describe("scope", () => {
       rows.map((r) => r.tablename),
       [
         "attempt_answers",
+        "auth_rate_limits",
+        "auth_sessions",
         "exam_attempts",
         "exam_questions",
         "exams",

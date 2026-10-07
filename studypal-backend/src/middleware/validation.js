@@ -1,3 +1,6 @@
+// SP-V2-008: usernames below come from the authenticated principal.
+// Client claims are optional and may never select a different account.
+import { authenticatedUsername } from "../auth/auth.middleware.js";
 /**
  * Request validation.
  *
@@ -27,7 +30,7 @@ function body(req) {
 
 /** POST /api/session — requires a non-blank username. */
 export function validateSessionRequest(req, _res, next) {
-  const { username } = body(req);
+  const username = authenticatedUsername(req, body(req).username);
 
   if (typeof username !== "string" || !username.trim()) {
     return next(badRequest("Username required"));
@@ -52,7 +55,8 @@ export function validateSessionRequest(req, _res, next) {
  * present and truthy, while `question` must be non-blank once trimmed.
  */
 export function validateAskRequest(req, _res, next) {
-  const { username, question } = body(req);
+  const { question } = body(req);
+  const username = authenticatedUsername(req, body(req).username);
 
   if (
     typeof username !== "string" ||
@@ -78,7 +82,7 @@ export function validateAskRequest(req, _res, next) {
 
 /** GET /api/history/:username and /api/progress/:username. */
 export function validateUsernameParam(req, _res, next) {
-  const username = req.params.username;
+  const username = authenticatedUsername(req, req.params.username);
 
   if (!username) {
     return next(badRequest("Username required"));

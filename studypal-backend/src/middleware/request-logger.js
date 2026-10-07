@@ -26,7 +26,7 @@ export function requestLogger(req, res, next) {
   res.on("finish", () => {
     const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
     logger.info(
-      `${req.method} ${truncate(req.originalUrl)} ${res.statusCode} ${ms.toFixed(1)}ms`,
+      `${req.method} ${truncate(req.path)} ${res.statusCode} ${ms.toFixed(1)}ms`,
     );
   });
 

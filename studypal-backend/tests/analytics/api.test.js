@@ -129,7 +129,7 @@ let server;
 let pool;
 
 before(async () => {
-  server = await startServer({ label: "analytics-api" });
+  server = await startServer({ authenticatedFixtures: true, label: "analytics-api" });
   pool = new pg.Pool({ connectionString: server.databaseUrl, max: 4 });
 });
 
@@ -601,22 +601,18 @@ describe("§18 the learner with no data", () => {
     assert.deepEqual(assertOk(await history(unknown)), []);
     assert.deepEqual(assertOk(await topics(unknown)), []);
   });
-
-  it("does not create the user it was asked about (§1)", async () => {
-    // A GET must not write. POST /api/ask upserts usernames; analytics must
-    // not, or reading a dashboard would populate the users table.
+  it("does not create users for anonymous analytics requests (§1)", async () => {
     const unknown = `${testUser("ghost")}_stays_absent`;
-    await overview(unknown);
-    await history(unknown);
-    await topics(unknown);
-    await weakAreas(unknown);
-    await materials(unknown);
-
-    const { rows } = await pool.query(
-      "SELECT 1 FROM users WHERE username = $1",
-      [unknown],
-    );
-    assert.equal(rows.length, 0, "analytics created a user row");
+    const { rows: before } = await pool.query("SELECT count(*) AS n FROM users");
+    // Raw requests cannot manufacture an authenticated identity.
+    const raw = await startServer({ env: { STUDYPAL_TEST_DATABASE_URL: server.databaseUrl } });
+    try {
+      for (const path of ["", "/exams", "/topics", "/weak-areas", "/materials"]) {
+        assert.equal((await raw.request("GET", `/api/analytics${path}?username=${unknown}`)).status, 401);
+      }
+    } finally { await raw.stop(); }
+    const { rows: after } = await pool.query("SELECT count(*) AS n FROM users");
+    assert.deepEqual(after, before);
   });
 });
 
@@ -1081,10 +1077,10 @@ describe("§3 GET /api/analytics/study-plans/:id", () => {
     }
   });
 
-  it("validates the id before the username, so the specific error wins", async () => {
+  it("requires authentication before disclosing validation details", async () => {
     const res = await server.request("GET", "/api/analytics/study-plans/abc");
 
-    assertJsonError(res, 400, "Study plan id must be a positive integer.");
+    assertJsonError(res, 401, "Authentication required.");
   });
 });
 
@@ -1207,12 +1203,12 @@ describe("§13 and §24 the route surface", () => {
     username = await makeUser("surface");
   });
 
-  it("requires a username on every endpoint (§11)", async () => {
+  it("requires a authenticated session on every endpoint (§11)", async () => {
     for (const endpoint of ALL_ENDPOINTS) {
       assertJsonError(
         await server.request("GET", endpoint.path()),
-        400,
-        "Username is required.",
+        401,
+        "Authentication required.",
       );
     }
   });
@@ -1373,7 +1369,7 @@ describe("§13 and §24 the route surface", () => {
       await server.request("GET", `${endpoint.path(planId)}?${q(populated)}`);
     }
     await history(populated, "&limit=50");
-    await overview(`${testUser("ghost")}_readonly`);
+    await overview(populated);
 
     assert.deepEqual(await census(), before);
   });

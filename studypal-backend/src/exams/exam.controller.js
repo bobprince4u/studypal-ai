@@ -30,7 +30,7 @@ import * as examService from "./exam.service.js";
  */
 export async function create(req, res) {
   const exam = await examService.createExam({
-    username: req.validated.username,
+    userId: req.user.id,
     subject: req.validated.subject,
     topics: req.validated.topics,
     difficulty: req.validated.difficulty,
@@ -46,7 +46,7 @@ export async function create(req, res) {
 export async function get(req, res) {
   res.json(
     await examService.getExam({
-      username: req.validated.username,
+      userId: req.user.id,
       examId: req.validated.examId,
     }),
   );
@@ -61,7 +61,7 @@ export async function get(req, res) {
  */
 export async function startAttempt(req, res) {
   const attempt = await examService.startAttempt({
-    username: req.validated.username,
+    userId: req.user.id,
     examId: req.validated.examId,
   });
 
@@ -79,7 +79,7 @@ export async function startAttempt(req, res) {
 export async function submitAttempt(req, res) {
   res.json(
     await examService.submitAttempt({
-      username: req.validated.username,
+      userId: req.user.id,
       examId: req.validated.examId,
       attemptId: req.validated.attemptId,
       answers: req.validated.answers,
@@ -91,7 +91,7 @@ export async function submitAttempt(req, res) {
 export async function getAttempt(req, res) {
   res.json(
     await examService.getAttempt({
-      username: req.validated.username,
+      userId: req.user.id,
       examId: req.validated.examId,
       attemptId: req.validated.attemptId,
     }),
@@ -101,6 +101,6 @@ export async function getAttempt(req, res) {
 /** GET /api/exam-attempts?username=… — that learner's history (§9). */
 export async function listAttempts(req, res) {
   res.json(
-    await examService.listAttempts({ username: req.validated.username }),
+    await examService.listAttempts({ userId: req.user.id }),
   );
 }

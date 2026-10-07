@@ -63,16 +63,16 @@ export function errorHandler(err, req, res, _next) {
   // 5xx means we broke; log the full error including cause and stack. 4xx is
   // the client's problem and only worth a one-liner.
   if (status >= 500) {
-    logger.error(`${req.method} ${req.originalUrl} -> ${status}`, err);
+    logger.error(`${req.method} ${req.path} -> ${status}`, err);
   } else {
-    logger.warn(`${req.method} ${req.originalUrl} -> ${status}: ${message}`);
+    logger.warn(`${req.method} ${req.path} -> ${status}: ${message}`);
   }
 
   if (res.headersSent) {
     return res.end();
   }
 
-  res.status(status).json({ error: message });
+  res.status(status).json({ error: message, ...(status === 429 && err.code ? { code: err.code } : {}) });
 }
 
 /**

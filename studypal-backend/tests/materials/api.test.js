@@ -52,7 +52,7 @@ let server;
 let pool;
 
 before(async () => {
-  server = await startServer({ label: "matapi" });
+  server = await startServer({ authenticatedFixtures: true, label: "matapi" });
   pool = new pg.Pool({ connectionString: server.databaseUrl, max: 4 });
 });
 
@@ -314,12 +314,12 @@ describe("POST /api/materials rejections", () => {
     assertJsonError(await upload(testUser("zero"), ZERO_BYTE_TXT), 400);
   });
 
-  it("rejects a missing username with 400", async () => {
+  it("rejects a missing username with 401", async () => {
     const res = await server.request("POST", "/api/materials", {
       form: materialForm({ file: SHORT_TXT }),
     });
-    assertJsonError(res, 400);
-    assert.match(res.body.error, /username/i);
+    assertJsonError(res, 401);
+    assert.match(res.body.error, /authentication/i);
   });
 
   it("rejects a blank username with 400", async () => {
@@ -444,8 +444,8 @@ describe("GET /api/materials", () => {
     assert.deepEqual(res.body, [], "an unknown username is not an error");
   });
 
-  it("requires a username", async () => {
-    assertJsonError(await server.request("GET", "/api/materials"), 400);
+  it("requires an authenticated session", async () => {
+    assertJsonError(await server.request("GET", "/api/materials"), 401);
     assertJsonError(await server.request("GET", "/api/materials?username="), 400);
   });
 });
@@ -488,7 +488,7 @@ describe("GET /api/materials/:id", () => {
     // §7 and §9 together: an embedding outage must not make a perfectly readable
     // document look broken, and must not make it look searchable either. A
     // separate server, because the mode is fixed for a process's lifetime.
-    const offline = await startServer({
+    const offline = await startServer({ authenticatedFixtures: true,
       label: "matnoembed",
       env: { FAKE_EMBEDDING_MODE: "http-error" },
     });
@@ -555,16 +555,16 @@ describe("GET /api/materials/:id", () => {
     }
   });
 
-  it("requires a username on every per-material route", async () => {
+  it("requires a authenticated session on every per-material route", async () => {
     const username = testUser("nouser");
     const created = await uploadOk(username, SHORT_TXT);
     for (const path of [
       `/api/materials/${created.id}`,
       `/api/materials/${created.id}/status`,
     ]) {
-      assertJsonError(await server.request("GET", path), 400);
+      assertJsonError(await server.request("GET", path), 401);
     }
-    assertJsonError(await server.request("DELETE", `/api/materials/${created.id}`), 400);
+    assertJsonError(await server.request("DELETE", `/api/materials/${created.id}`), 401);
   });
 });
 

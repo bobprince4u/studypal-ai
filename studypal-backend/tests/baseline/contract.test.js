@@ -42,7 +42,7 @@ describe("baseline contract", () => {
     // and drops it in stop(). Before SP-V2-002 this passed a DATABASE_PATH into
     // a temp directory; the isolation requirement is the same, the mechanism is
     // not. See tests/helpers/test-database.mjs.
-    srv = await startServer({ label: "contract" });
+    srv = await startServer({ authenticatedFixtures: true, label: "contract" });
   });
 
   after(async () => {
@@ -98,10 +98,10 @@ describe("baseline contract", () => {
       assert.equal(res.body.username, username);
     });
 
-    test("rejects a missing username with 400 Username required", async () => {
+    test("rejects a missing username with 401 Authentication required.", async () => {
       const res = await srv.request("POST", "/api/session", { json: {} });
-      assert.equal(res.status, 400);
-      assert.deepEqual(res.body, { error: "Username required" });
+      assert.equal(res.status, 401);
+      assert.deepEqual(res.body, { error: "Authentication required." });
     });
 
     test("rejects a whitespace-only username with 400", async () => {
@@ -109,7 +109,7 @@ describe("baseline contract", () => {
         json: { username: "     " },
       });
       assert.equal(res.status, 400);
-      assert.deepEqual(res.body, { error: "Username required" });
+      assert.deepEqual(res.body, { error: "Username is required." });
     });
 
     test("rejects an empty-string username with 400", async () => {
@@ -117,7 +117,7 @@ describe("baseline contract", () => {
         json: { username: "" },
       });
       assert.equal(res.status, 400);
-      assert.deepEqual(res.body, { error: "Username required" });
+      assert.deepEqual(res.body, { error: "Username is required." });
     });
   });
 
@@ -164,13 +164,13 @@ describe("baseline contract", () => {
       });
     });
 
-    test("rejects a missing username with 400", async () => {
+    test("rejects a missing username with 401", async () => {
       const res = await srv.request("POST", "/api/ask", {
         form: askForm({ question: "anything" }),
       });
-      assert.equal(res.status, 400);
+      assert.equal(res.status, 401);
       assert.deepEqual(res.body, {
-        error: "Username and question required",
+        error: "Authentication required.",
       });
     });
 
@@ -465,7 +465,7 @@ describe("baseline contract", () => {
 // ──────────────────────────────────────────────────────────────────────────
 describe("AI response repair", () => {
   test("parses JSON wrapped in ```json fences", async () => {
-    const srv = await startServer({
+    const srv = await startServer({ authenticatedFixtures: true,
       label: "fenced",
       env: { FAKE_GEMINI_MODE: "fenced" },
     });
@@ -481,7 +481,7 @@ describe("AI response repair", () => {
   });
 
   test("falls back to the placeholder answer for non-JSON output", async () => {
-    const srv = await startServer({
+    const srv = await startServer({ authenticatedFixtures: true,
       label: "prose",
       env: { FAKE_GEMINI_MODE: "prose" },
     });
@@ -514,7 +514,7 @@ describe("AI response repair", () => {
 
   for (const mode of ["http-error", "network-error"]) {
     test(`returns 500 {error} when the AI ${mode === "http-error" ? "rejects the request" : "is unreachable"}`, async () => {
-      const srv = await startServer({
+      const srv = await startServer({ authenticatedFixtures: true,
         label: mode,
         env: { FAKE_GEMINI_MODE: mode },
       });

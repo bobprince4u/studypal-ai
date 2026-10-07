@@ -1,17 +1,18 @@
+import { expensiveOperationLimit } from "../auth/rate-limit.middleware.js";
 /**
  * The six material endpoints (§10, plus SP-V2-004's chat endpoint).
  *
- *   POST   /api/materials                 multipart: username, file
- *   POST   /api/materials/chat            JSON: username, question, materialId?
- *   GET    /api/materials?username=…
- *   GET    /api/materials/:id?username=…
- *   GET    /api/materials/:id/status?username=…
- *   DELETE /api/materials/:id?username=…
+ *   POST   /api/materials                 multipart: file (optional legacy username assertion)
+ *   POST   /api/materials/chat            JSON: question, materialId? (optional legacy username assertion)
+ *   GET    /api/materials (optional legacy username assertion)
+ *   GET    /api/materials/:id (optional legacy username assertion)
+ *   GET    /api/materials/:id/status (optional legacy username assertion)
+ *   DELETE /api/materials/:id (optional legacy username assertion)
  *
  * MIDDLEWARE ORDER
  * ----------------
  * On the upload route, `acceptMaterialFile` must precede `validateUploadBody`:
- * until multer has parsed the multipart body there is no `req.body.username` and
+ * until multer has parsed the multipart body there is no parsed `req.body` or
  * no `req.file` to check. The same constraint governs POST /api/ask in
  * questions.routes.js.
  *
@@ -59,6 +60,7 @@ export const materialRoutes = Router();
 
 materialRoutes.post(
   "/materials",
+  expensiveOperationLimit("upload"),
   acceptMaterialFile,
   validateUploadBody,
   asyncHandler(upload),
@@ -66,6 +68,7 @@ materialRoutes.post(
 
 materialRoutes.post(
   "/materials/chat",
+  expensiveOperationLimit("chat"),
   validateChatBody,
   asyncHandler(chat),
 );

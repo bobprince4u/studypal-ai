@@ -53,7 +53,7 @@ const ALL_DAYS = [
  * behind it.
  */
 async function planServer(label, env = {}) {
-  const server = await startServer({ label, env });
+  const server = await startServer({ authenticatedFixtures: true, label, env });
   const pool = new pg.Pool({ connectionString: server.databaseUrl, max: 4 });
 
   let sequence = 0;

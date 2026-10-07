@@ -1,4 +1,6 @@
 "use client";
+import { apiFetch } from "./auth-client";
+import { useAuth } from "./auth-provider";
 
 import { useState, useRef, useEffect, useCallback } from "react";
 
@@ -494,7 +496,8 @@ function ProgressPanel({ progress, countKey }) {
 export default function Home() {
   const [screen, setScreen] = useState("login");
   const [username, setUsername] = useState("");
-  const [inputName, setInputName] = useState("");
+  const account = useAuth();
+  const inputName = account.username;
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [messages, setMessages] = useState([]);
@@ -523,13 +526,17 @@ export default function Home() {
   }, [progress.total_questions]);
 
   const loadHistory = useCallback(async (user) => {
-    const res = await fetch(`${API}/api/history/${encodeURIComponent(user)}`);
-    setHistory(await res.json());
+    const res = await apiFetch(`${API}/api/history`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "History could not be loaded.");
+    setHistory(data);
   }, []);
 
   const loadProgress = useCallback(async (user) => {
-    const res = await fetch(`${API}/api/progress/${encodeURIComponent(user)}`);
-    setProgress(await res.json());
+    const res = await apiFetch(`${API}/api/progress`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Progress could not be loaded.");
+    setProgress(data);
   }, []);
 
   const handleLogin = async () => {
@@ -540,10 +547,10 @@ export default function Home() {
     setLoginLoading(true);
     setLoginError("");
     try {
-      const res = await fetch(`${API}/api/session`, {
+      const res = await apiFetch(`${API}/api/session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: inputName.trim() }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -575,12 +582,11 @@ export default function Home() {
     ]);
 
     const formData = new FormData();
-    formData.append("username", username);
     formData.append("question", q);
     if (f) formData.append("file", f);
 
     try {
-      const res = await fetch(`${API}/api/ask`, {
+      const res = await apiFetch(`${API}/api/ask`, {
         method: "POST",
         body: formData,
       });
@@ -710,30 +716,9 @@ export default function Home() {
               textAlign: "left",
             }}
           >
-            Your name or student ID
+            Your account
           </label>
-          <input
-            type="text"
-            value={inputName}
-            onChange={(e) => setInputName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleLogin()}
-            placeholder="e.g. Amara or STU001"
-            autoFocus
-            onFocus={(e) => (e.target.style.borderColor = "var(--gold)")}
-            onBlur={(e) => (e.target.style.borderColor = "var(--border)")}
-            style={{
-              width: "100%",
-              background: "var(--bg3)",
-              border: "1px solid var(--border)",
-              borderRadius: 10,
-              padding: "14px 16px",
-              color: "var(--cream)",
-              fontFamily: "inherit",
-              fontSize: "0.95rem",
-              outline: "none",
-              transition: "border-color 0.2s",
-            }}
-          />
+          <p>Signed in as {inputName}</p>
           {loginError && (
             <p
               className="msg-in"

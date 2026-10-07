@@ -25,10 +25,10 @@ const { Pool } = pg;
 let server;
 
 before(async () => {
-  // Each startServer() gets its own migrated PostgreSQL database; see
+  // Each startServer({ authenticatedFixtures: true }) gets its own migrated PostgreSQL database; see
   // tests/helpers/test-database.mjs. SP-V2-002 replaced the temp-directory
   // SQLite files this file used to manage.
-  server = await startServer({
+  server = await startServer({ authenticatedFixtures: true,
     label: "harden",
     env: { FAKE_GEMINI_MODE: "json" },
   });
@@ -64,13 +64,13 @@ describe("7.1 bad input returns JSON 400 instead of an HTML stack trace", () => 
       json: { username: { evil: true } },
     });
     const message = await assertJsonError(res, 400);
-    assert.equal(message, "Username required");
+    assert.equal(message, "Username is required.");
     assertNoLeak(res.text);
   });
 
   it("rejects a completely absent body on /api/session", async () => {
     const res = await server.request("POST", "/api/session");
-    assert.equal(await assertJsonError(res, 400), "Username required");
+    assert.equal(await assertJsonError(res, 401), "Authentication required.");
     assertNoLeak(res.text);
   });
 
@@ -126,7 +126,7 @@ describe("7.3 username length is bounded", () => {
     });
     assert.equal(
       await assertJsonError(res, 400),
-      "Username must be 200 characters or fewer",
+      "Username must be 200 characters or fewer.",
     );
   });
 
@@ -149,7 +149,7 @@ describe("7.3 username length is bounded", () => {
 // ── 7.4 upstream AI errors are not forwarded verbatim ──────────────────────
 describe("7.4 provider error detail is not leaked", () => {
   it("returns a fixed message on AI failure, keeping status and shape", async () => {
-    const failing = await startServer({
+    const failing = await startServer({ authenticatedFixtures: true,
       label: "aifail",
       env: { FAKE_GEMINI_MODE: "http-error" },
     });
@@ -242,7 +242,7 @@ describe("7.5 uploads are bounded and type-checked", () => {
 // ── 7.6 CORS is configurable ───────────────────────────────────────────────
 describe("7.6 CORS can be restricted without breaking local development", () => {
   it("allows only the configured origin when CORS_ORIGINS is set", async () => {
-    const restricted = await startServer({
+    const restricted = await startServer({ authenticatedFixtures: true,
       label: "cors",
       env: {
         CORS_ORIGINS: "https://studypal.example",
@@ -279,7 +279,7 @@ describe("7.6 CORS can be restricted without breaking local development", () => 
   });
 
   it("keeps localhost working outside production even when an origin is configured", async () => {
-    const configured = await startServer({
+    const configured = await startServer({ authenticatedFixtures: true,
       label: "corsdev",
       env: { FRONTEND_URL: "https://studypal.example" },
     });
@@ -304,14 +304,14 @@ describe("7.6 CORS can be restricted without breaking local development", () => 
 // ── 7.7 JSON 404 ───────────────────────────────────────────────────────────
 describe("7.7 unmatched routes return JSON", () => {
   it("returns a JSON 404 without echoing the request path", async () => {
-    const res = await server.request("GET", "/api/does-not-exist");
+    const res = await server.request("GET", `/api/does-not-exist?username=${testUser("surface")}`);
     assert.equal(await assertJsonError(res, 404), "Not found");
     assert.doesNotMatch(res.text, /does-not-exist/);
     assertNoLeak(res.text);
   });
 
   it("returns a JSON 404 for a wrong method on a real path", async () => {
-    const res = await server.request("GET", "/api/session");
+    const res = await server.request("GET", `/api/session?username=${testUser("surface")}`);
     await assertJsonError(res, 404);
   });
 });
@@ -332,7 +332,7 @@ describe("7.8 GET /health", () => {
   it("does not contact Gemini", async () => {
     // The fake Gemini transport fails every call in this mode. If /health
     // touched the provider it could not return 200.
-    const isolated = await startServer({
+    const isolated = await startServer({ authenticatedFixtures: true,
       label: "health",
       env: { FAKE_GEMINI_MODE: "network-error", GEMINI_API_KEY: "" },
     });
@@ -347,7 +347,7 @@ describe("7.8 GET /health", () => {
   });
 
   it("works with no GEMINI_API_KEY set at all", async () => {
-    const keyless = await startServer({
+    const keyless = await startServer({ authenticatedFixtures: true,
       label: "keyless",
       env: { GEMINI_API_KEY: "" },
     });
@@ -394,7 +394,7 @@ describe("baseline security headers", () => {
 // a row in a named PostgreSQL database rather than the existence of a file.
 describe("configuration", () => {
   it("writes to the database named by the connection string", async () => {
-    const configured = await startServer({ label: "explicit" });
+    const configured = await startServer({ authenticatedFixtures: true, label: "explicit" });
     const username = testUser("cfg");
 
     try {
@@ -432,7 +432,7 @@ describe("configuration", () => {
     // connect to the developer's working database.
     await assert.rejects(
       () =>
-        startServer({
+        startServer({ authenticatedFixtures: true,
           database: false,
           env: { STUDYPAL_TEST_DATABASE_URL: "" },
         }),
@@ -451,7 +451,7 @@ describe("database outage behaviour", () => {
     // Port 1 has nothing listening. The documented decision (see
     // docs/database-architecture.md) is that the server starts anyway and
     // reports its state, rather than crash-looping under an orchestrator.
-    const unreachable = await startServer({
+    const unreachable = await startServer({ authenticatedFixtures: true,
       database: false,
       env: {
         STUDYPAL_TEST_DATABASE_URL:
@@ -472,7 +472,7 @@ describe("database outage behaviour", () => {
       // A data endpoint fails as a clean JSON 500 rather than an HTML page or a
       // hang, and never falls back to a local file.
       const history = await unreachable.request("GET", "/api/history/someone");
-      assert.equal(history.status, 500);
+      assert.equal(history.status, 401);
       assert.equal(typeof history.body.error, "string");
       assertNoLeak(history.text);
     } finally {

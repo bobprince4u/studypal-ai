@@ -24,7 +24,7 @@ import * as analyticsService from "./analytics.service.js";
 /** GET /api/analytics?username=… — the overall learning summary (§2). */
 export async function getOverview(req, res) {
   res.json(
-    await analyticsService.getOverview({ username: req.validated.username }),
+    await analyticsService.getOverview({ userId: req.user.id }),
   );
 }
 
@@ -38,7 +38,7 @@ export async function getOverview(req, res) {
 export async function getExamHistory(req, res) {
   res.json(
     await analyticsService.getExamHistory({
-      username: req.validated.username,
+      userId: req.user.id,
       limit: req.validated.limit,
     }),
   );
@@ -48,7 +48,7 @@ export async function getExamHistory(req, res) {
 export async function getTopicBreakdown(req, res) {
   res.json(
     await analyticsService.getTopicBreakdown({
-      username: req.validated.username,
+      userId: req.user.id,
     }),
   );
 }
@@ -56,7 +56,7 @@ export async function getTopicBreakdown(req, res) {
 /** GET /api/analytics/weak-areas?username=… — deterministic weak areas (§10). */
 export async function getWeakAreas(req, res) {
   res.json(
-    await analyticsService.getWeakAreas({ username: req.validated.username }),
+    await analyticsService.getWeakAreas({ userId: req.user.id }),
   );
 }
 
@@ -64,7 +64,7 @@ export async function getWeakAreas(req, res) {
 export async function getMaterialBreakdown(req, res) {
   res.json(
     await analyticsService.getMaterialBreakdown({
-      username: req.validated.username,
+      userId: req.user.id,
     }),
   );
 }
@@ -73,7 +73,7 @@ export async function getMaterialBreakdown(req, res) {
 export async function getPlanProgress(req, res) {
   res.json(
     await analyticsService.getPlanProgress({
-      username: req.validated.username,
+      userId: req.user.id,
       planId: req.validated.planId,
     }),
   );

@@ -22,7 +22,10 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes, createHash } from "node:crypto";
+import pg from "pg";
+import { hashPassword } from "../../src/auth/password.js";
+let fixturePasswordHash;
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -125,6 +128,13 @@ export async function startServer(opts = {}) {
         NODE_ENV: "test",
         ...(database ? { STUDYPAL_TEST_DATABASE_URL: database.url } : {}),
         STUDYPAL_STORAGE_DIR: storageDir,
+        ...(opts.authenticatedFixtures ? {
+          STUDYPAL_RATE_UPLOAD_LIMIT: "1000",
+          STUDYPAL_RATE_CHAT_LIMIT: "1000",
+          STUDYPAL_RATE_STUDY_PLAN_LIMIT: "1000",
+          STUDYPAL_RATE_EXAM_LIMIT: "1000",
+          STUDYPAL_RATE_ASK_LIMIT: "1000",
+        } : {}),
         ...opts.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -178,6 +188,26 @@ export async function startServer(opts = {}) {
    */
   async function request(method, pathname, { json, form, body, headers } = {}) {
     const init = { method, headers: { ...headers } };
+    // Explicit opt-in for pre-auth feature regression suites. Each requested
+    // learner receives a genuine persisted session in this isolated test DB.
+    // Authentication tests use the default raw client and never enter this path.
+    if (opts.authenticatedFixtures && database && !headers?.cookie && !pathname.startsWith("/api/auth/")) {
+      init.headers["x-studypal-request"] = "1";
+      const url = new URL(pathname, base);
+      const claim = json?.username ?? form?.get("username") ?? url.searchParams.get("username") ?? (/^\/api\/(history|progress)\/(.*)$/.exec(url.pathname)?.[2]);
+      if (claim != null || (json && Object.hasOwn(json, "username") && json.username !== undefined) || form?.has("username") || url.searchParams.has("username") || body !== undefined) {
+      const username = typeof claim === "string" && claim.trim() && claim.length <= 200 && !claim.includes("\0") ? decodeURIComponent(claim).trim() : "fixture_authenticated_user";
+      fixturePasswordHash ??= hashPassword("fixture password only for isolated tests");
+      const passwordHash = await fixturePasswordHash;
+      const token = randomBytes(32).toString("hex");
+      const pool = new pg.Pool({connectionString:database.url,max:1});
+      try {
+        const {rows} = await pool.query("INSERT INTO users(username,password_hash) VALUES($1,$2) ON CONFLICT(username) DO UPDATE SET password_hash=EXCLUDED.password_hash RETURNING id", [username,passwordHash]);
+        await pool.query("INSERT INTO auth_sessions(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval '12 hours')", [createHash("sha256").update(token).digest("hex"),rows[0].id]);
+        init.headers.cookie = `studypal_session=${token}`;
+      } finally {await pool.end();}
+      }
+    }
     if (json !== undefined) {
       init.headers["content-type"] = "application/json";
       init.body = JSON.stringify(json);
@@ -194,7 +224,7 @@ export async function startServer(opts = {}) {
     } catch {
       parsed = text;
     }
-    return { status: res.status, headers: res.headers, body: parsed, text };
+    return { status: res.status, headers: res.headers, body: parsed, text, requestCookie:init.headers.cookie };
   }
 
   return {

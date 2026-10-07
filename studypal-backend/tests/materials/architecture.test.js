@@ -205,38 +205,10 @@ describe("§27 SQL stays in the repository layer", () => {
     assertNoSql(await readAll(files), "§27: no SQL in document extraction modules.");
   });
 
-  it("no service outside the known SP-V2-002 exception contains SQL", async () => {
-    /**
-     * src/services/question.service.js holds one inline `INSERT INTO users …
-     * ON CONFLICT` so that the user upsert and the question insert share a single
-     * transaction. It predates this iteration, §19 forbids changing /api/ask's
-     * behaviour, and it is reported as SP-V2-002 technical debt rather than
-     * silently permitted: the fix is an optional executor argument on
-     * user.repository.upsert, which belongs to whichever iteration touches that
-     * endpoint next.
-     *
-     * Naming it here is the point. The rule still holds for every other service —
-     * including all of this iteration's — and a NEW service carrying SQL fails
-     * this test, which is what §3's "do not reintroduce ad-hoc SQL in
-     * controllers/services" needs to mean in practice.
-     */
-    const KNOWN_EXCEPTION = "src/services/question.service.js";
-    const files = (await jsFiles(SRC)).filter(
-      (file) => /\.service\./.test(file) && file !== KNOWN_EXCEPTION,
-    );
+  it("no service contains SQL, including question writes", async () => {
+    const files = (await jsFiles(SRC)).filter(file => /\.service\./.test(file));
     assert.ok(files.length >= 3);
-    assertNoSql(
-      await readAll(files),
-      "Services orchestrate; repositories own SQL (§3).",
-    );
-
-    // And the exception is exactly one statement, so it cannot quietly grow.
-    const exception = stripComments(
-      await fs.readFile(path.join(BACKEND_ROOT, KNOWN_EXCEPTION), "utf8"),
-    );
-    assert.deepEqual(exception.match(/\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)/gi), [
-      "INSERT INTO",
-    ]);
+    assertNoSql(await readAll(files), "Services orchestrate; repositories own SQL.");
   });
 
   it("no material module but the repository opens a database connection", async () => {

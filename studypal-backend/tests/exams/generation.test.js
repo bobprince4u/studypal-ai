@@ -54,7 +54,7 @@ const GENERATION_FAILED = "AI exam generation failed";
  * ready-made user.
  */
 async function withMode(mode, body) {
-  const server = await startServer({
+  const server = await startServer({ authenticatedFixtures: true,
     label: `exam-gen-${mode}`,
     env: { FAKE_EXAM_MODE: mode },
   });

@@ -140,7 +140,7 @@ let server;
 let pool;
 
 before(async () => {
-  server = await startServer({ label: "exam-api" });
+  server = await startServer({ authenticatedFixtures: true, label: "exam-api" });
   pool = new pg.Pool({ connectionString: server.databaseUrl, max: 6 });
 });
 
@@ -541,11 +541,11 @@ describe("POST /api/exams returns the documented shape (§9, §20)", () => {
 // ── §15: the rejections ─────────────────────────────────────────────────────
 
 describe("POST /api/exams rejects bad input (§15)", () => {
-  it("requires a username and a subject", async () => {
+  it("requires authentication and a subject", async () => {
     assertJsonError(
       await createExam({ subject: "Biology" }),
-      400,
-      "Username is required.",
+      401,
+      "Authentication required.",
     );
     assertJsonError(
       await createExam({ username: "   ", subject: "Biology" }),
@@ -652,15 +652,9 @@ describe("POST /api/exams rejects bad input (§15)", () => {
       "Each material id must be a positive integer.",
     );
   });
-
-  it("answers an unknown username with the same 404 as an unknown exam (§12)", async () => {
-    // Not a 401 and not a "no such user": whether a username exists is not
-    // something an unauthenticated caller gets to learn from this endpoint.
-    assertJsonError(
-      await createExam(examBody("nobody_at_all_1234")),
-      404,
-      "Exam not found.",
-    );
+  it("creates exams only for an authenticated existing account", async () => {
+    const res = await createExam(examBody("nobody_at_all_1234"));
+    assert.equal(res.status, 201);
   });
 
   it("persists nothing when the request is refused", async () => {
@@ -790,13 +784,13 @@ describe("GET /api/exams/:id returns one exam without its key (§9)", () => {
     }
   });
 
-  it("requires a username in the query string", async () => {
+  it("requires a authenticated session in the query string", async () => {
     const username = await makeUser();
     const exam = await createExamOk(username);
     assertJsonError(
       await server.request("GET", `/api/exams/${exam.id}`),
-      400,
-      "Username is required.",
+      401,
+      "Authentication required.",
     );
   });
 
@@ -934,10 +928,10 @@ describe("POST /api/exams/:id/attempts starts one attempt (§9, §11)", () => {
     assert.equal(rows[0].n, 2);
   });
 
-  it("requires a username in the body", async () => {
+  it("requires a authenticated session in the body", async () => {
     const username = await makeUser();
     const exam = await createExamOk(username);
-    assertJsonError(await startAttempt(exam.id, {}), 400, "Username is required.");
+    assertJsonError(await startAttempt(exam.id, {}), 401, "Authentication required.");
   });
 
   it("answers an unknown exam with 404, and a bad id with 400", async () => {
@@ -1544,13 +1538,15 @@ describe("GET /api/exam-attempts is one learner's history (§9, §12)", () => {
     assert.deepEqual(res.body, [], "empty, not someone else's");
   });
 
-  it("requires a username, and 404s an unknown one", async () => {
+  it("requires authentication and returns empty history for a new account", async () => {
     assertJsonError(
       await server.request("GET", "/api/exam-attempts"),
-      400,
-      "Username is required.",
+      401,
+      "Authentication required.",
     );
-    assertJsonError(await listAttempts("nobody_at_all_5678"), 404, "Exam not found.");
+    const history = await listAttempts("nobody_at_all_5678");
+    assert.equal(history.status, 200);
+    assert.deepEqual(history.body, []);
   });
 });
 
@@ -1668,7 +1664,7 @@ describe("the endpoint surface is exactly six routes (§9)", () => {
   });
 
   it("answers unknown exam paths with JSON, not an HTML error page", async () => {
-    const res = await server.request("GET", "/api/exams/1/attempts");
+    const res = await server.request("GET", `/api/exams/1/attempts?username=${testUser("surface")}`);
     assert.equal(res.status, 404);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     assert.equal(res.body.error, "Not found");

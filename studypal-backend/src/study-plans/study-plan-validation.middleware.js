@@ -1,3 +1,6 @@
+// SP-V2-008: usernames below come from the authenticated principal.
+// Client claims are optional and may never select a different account.
+import { authenticatedUsername } from "../auth/auth.middleware.js";
 /**
  * Request validation for /api/study-plans.
  *
@@ -58,7 +61,7 @@ const TASK_STATUSES = new Set([
 export function validateCreatePlanBody(req, _res, next) {
   // `?? {}` for the reason the material validators do it: with no body at all,
   // `req.body` is undefined and destructuring would turn a plain 400 into a 500.
-  const body = req.body ?? {};
+  const body = { ...req.body, username: authenticatedUsername(req, req.body?.username) };
 
   const username = readUsername(body.username);
   if (username === null) {
@@ -137,7 +140,7 @@ export function validateCreatePlanBody(req, _res, next) {
  * quietly taking the first is how filter-bypass bugs start.
  */
 export function validateUsernameQuery(req, _res, next) {
-  const username = readUsername(req.query?.username);
+  const username = readUsername(authenticatedUsername(req, req.query?.username));
   if (username === null) {
     return next(badRequest("Username is required."));
   }
@@ -160,7 +163,7 @@ export function validateUsernameQuery(req, _res, next) {
  * string, because both are writes with a body already. Same rules either way.
  */
 export function validateUsernameBody(req, _res, next) {
-  const username = readUsername((req.body ?? {}).username);
+  const username = readUsername(authenticatedUsername(req, req.body?.username));
   if (username === null) {
     return next(badRequest("Username is required."));
   }

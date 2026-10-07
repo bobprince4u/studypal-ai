@@ -1,3 +1,4 @@
+import { expensiveOperationLimit } from "../auth/rate-limit.middleware.js";
 /**
  * POST /api/ask, GET /api/history/:username, GET /api/progress/:username
  *
@@ -19,6 +20,7 @@ export const questionRoutes = Router();
 
 questionRoutes.post(
   "/ask",
+  expensiveOperationLimit("ask"),
   acceptOptionalFile,
   validateAskRequest,
   asyncHandler(ask),
@@ -36,3 +38,7 @@ questionRoutes.get(
   validateUsernameParam,
   asyncHandler(progress),
 );
+
+// Current identity-free read API; username path variants are deprecated aliases.
+questionRoutes.get("/history", asyncHandler(history));
+questionRoutes.get("/progress", asyncHandler(progress));

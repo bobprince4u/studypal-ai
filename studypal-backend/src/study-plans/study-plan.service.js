@@ -1,3 +1,4 @@
+// SP-V2-008: ownership is scoped by the authenticated immutable users.id.
 /**
  * Study plan orchestration: the layer that owns the order things happen in.
  *
@@ -7,7 +8,7 @@
  *
  * THE ORDER, AND WHY IT IS THIS ORDER (§25)
  * -----------------------------------------
- *   1. resolve the username to a user id            — ownership starts here
+ *   1. validate the authenticated user id            — ownership starts here
  *   2. resolve material ids against that user       — §10, never the client's word
  *   3. compute the available study dates            — §13, backend owns the calendar
  *   4. retrieve material context                    — §14, bounded, reused RAG
@@ -39,7 +40,7 @@
 import { config } from "../config/env.js";
 import { badRequest, internal, notFound } from "../utils/app-error.js";
 import { logger } from "../utils/logger.js";
-import * as users from "../repositories/user.repository.js";
+import { assertUserId } from "../auth/identity.js";
 import * as planRepository from "./study-plan.repository.js";
 import { buildMaterialBrief, resolveMaterials } from "./material-brief.js";
 import { generateStudyPlan } from "./study-plan-generator.js";
@@ -53,7 +54,7 @@ import { availableStudyDates, todayIso } from "./study-calendar.js";
  * @returns {Promise<object>} the API shape, tasks included
  */
 export async function createStudyPlan({
-  username,
+  userId,
   subject,
   topics,
   examDate,
@@ -62,7 +63,7 @@ export async function createStudyPlan({
   studyDays,
   materialIds,
 }) {
-  const userId = await requireUserId(username);
+  assertUserId(userId);
 
   return generateAndPersist({
     userId,
@@ -88,7 +89,7 @@ export async function createStudyPlan({
  * transaction so there is no moment at which both are active or neither is.
  *
  * The goals come from the stored plan rather than from the request, which is why
- * this endpoint's body is only `{username}`. That is not merely convenient: a
+ * this endpoint's body is only `{userId}`. That is not merely convenient: a
  * regeneration that accepted new goals would be a create endpoint with a
  * confusing name, and the lineage `parent_plan_id` records would be a lie about
  * what the two plans have in common.
@@ -99,11 +100,11 @@ export async function createStudyPlan({
  *
  * @param {object} input
  * @param {number} input.id the plan to regenerate from
- * @param {string} input.username
+ * @param {number} input.userId
  * @returns {Promise<object>} the NEW plan, in the API shape
  */
-export async function regenerateStudyPlan({ id, username }) {
-  const userId = await requireUserId(username);
+export async function regenerateStudyPlan({ id, userId }) {
+  assertUserId(userId);
 
   const original = await planRepository.findOwnedById(id, userId);
   if (!original) throw notFoundPlan();
@@ -143,7 +144,7 @@ async function generateAndPersist({ userId, goals, parentPlanId }) {
     // and received one grounded in three has been given something other than
     // what they asked for, with nothing in the response to say so. The message
     // does not say WHICH ids failed or whether they exist at all — that would
-    // let an unauthenticated caller enumerate material ids by watching the
+    // let a caller enumerate material ids by watching the
     // error change.
     throw badRequest(
       "One or more of the selected materials could not be found.",
@@ -250,17 +251,16 @@ async function generateAndPersist({ userId, goals, parentPlanId }) {
 /**
  * A user's plans, newest first (§26).
  *
- * Metadata only — no task lists. An unknown username gives an empty array rather
+ * Metadata only — no task lists. An unknown userId gives an empty array rather
  * than a 404, matching listMaterials and GET /api/history: the frontend maps over
  * the result unguarded, and "this user has nothing" and "this user does not
  * exist" are the same answer to a client that cannot authenticate anyway.
  *
- * @param {string} username
+ * @param {number} userId
  * @returns {Promise<Array<object>>} always an array
  */
-export async function listStudyPlans(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) return [];
+export async function listStudyPlans(userId) {
+  assertUserId(userId);
 
   const rows = await planRepository.findByUserId(userId, PLAN_LIST_LIMIT);
   return rows.map((row) => toSummaryShape(row));
@@ -271,12 +271,12 @@ export async function listStudyPlans(username) {
  *
  * @param {object} input
  * @param {number} input.id
- * @param {string} input.username
+ * @param {number} input.userId
  * @returns {Promise<object>}
  * @throws {AppError} 404 if it does not exist OR is not theirs
  */
-export async function getStudyPlan({ id, username }) {
-  const userId = await requireUserId(username);
+export async function getStudyPlan({ id, userId }) {
+  assertUserId(userId);
 
   const plan = await planRepository.findOwnedById(id, userId);
   if (!plan) throw notFoundPlan();
@@ -299,13 +299,13 @@ export async function getStudyPlan({ id, username }) {
  * @param {object} input
  * @param {number} input.planId
  * @param {number} input.taskId
- * @param {string} input.username
+ * @param {number} input.userId
  * @param {string} input.status already validated against the allowed set
  * @returns {Promise<object>} the updated task, plus the plan's derived status
  * @throws {AppError} 404 if the user, plan or task does not match
  */
-export async function updateTaskStatus({ planId, taskId, username, status }) {
-  const userId = await requireUserId(username);
+export async function updateTaskStatus({ planId, taskId, userId, status }) {
+  assertUserId(userId);
 
   const task = await planRepository.updateTaskStatus({
     taskId,
@@ -316,7 +316,7 @@ export async function updateTaskStatus({ planId, taskId, username, status }) {
 
   // One 404 for four situations: no such plan, no such task, a task of a
   // different plan, a plan of a different user. Distinguishing them would tell
-  // an unauthenticated caller which ids are real.
+  // a caller which ids are real.
   if (!task) throw notFoundPlan();
 
   const plan = await planRepository.recomputePlanStatus(planId);
@@ -410,26 +410,22 @@ function toTaskShape(task) {
 }
 
 /**
- * Resolve a username to a user id, or 404.
+ * Resolve a userId to a user id, or 404.
  *
  * Study-plan endpoints do not create users — §10 requires an existing one. That
  * differs from POST /api/ask and POST /api/materials, which upsert, and the
- * difference is deliberate: those endpoints are how a username comes into
+ * difference is deliberate: those endpoints are how a userId comes into
  * existence, and a plan is built from a learner's materials and history rather
  * than being someone's first interaction with the service.
  */
-async function requireUserId(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) throw notFoundPlan();
-  return userId;
-}
+
 
 /**
  * The 404 every ownership failure produces.
  *
  * One message for five situations — no such user, no such plan, someone else's
  * plan, no such task, a task of another plan — because distinguishing them would
- * tell an unauthenticated caller which ids exist. 404 rather than 403 for the
+ * tell a caller which ids exist. 404 rather than 403 for the
  * reason src/utils/app-error.js records: a 403 confirms the resource is real.
  */
 function notFoundPlan() {

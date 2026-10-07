@@ -29,7 +29,7 @@ import * as studyPlanService from "./study-plan.service.js";
  */
 export async function create(req, res) {
   const plan = await studyPlanService.createStudyPlan({
-    username: req.validated.username,
+    userId: req.user.id,
     subject: req.validated.subject,
     topics: req.validated.topics,
     examDate: req.validated.examDate,
@@ -44,7 +44,7 @@ export async function create(req, res) {
 
 /** GET /api/study-plans?username=… — that user's plans, newest first (§26). */
 export async function list(req, res) {
-  res.json(await studyPlanService.listStudyPlans(req.validated.username));
+  res.json(await studyPlanService.listStudyPlans(req.user.id));
 }
 
 /** GET /api/study-plans/:id?username=… — one plan, with its tasks (§27). */
@@ -52,7 +52,7 @@ export async function get(req, res) {
   res.json(
     await studyPlanService.getStudyPlan({
       id: req.validated.id,
-      username: req.validated.username,
+      userId: req.user.id,
     }),
   );
 }
@@ -70,7 +70,7 @@ export async function updateTaskStatus(req, res) {
     await studyPlanService.updateTaskStatus({
       planId: req.validated.planId,
       taskId: req.validated.taskId,
-      username: req.validated.username,
+      userId: req.user.id,
       status: req.validated.status,
     }),
   );
@@ -86,7 +86,7 @@ export async function updateTaskStatus(req, res) {
 export async function regenerate(req, res) {
   const plan = await studyPlanService.regenerateStudyPlan({
     id: req.validated.id,
-    username: req.validated.username,
+    userId: req.user.id,
   });
 
   res.status(201).json(plan);

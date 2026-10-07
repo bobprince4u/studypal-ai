@@ -1,40 +1,12 @@
-/**
- * Material use cases: upload, list, get, status, delete.
- *
- * The orchestration layer. It resolves the username to a user, calls validation,
- * storage, processing and the repository in the right order, and shapes what the
- * API returns. It never touches `req` or `res`, never writes SQL, and never calls
- * `fs` — those belong to the controller, the repository and
- * local-storage.service.js respectively.
- *
- * OWNERSHIP
- * ---------
- * Every function here takes a `username` and resolves it to a `users.id` through
- * the EXISTING src/repositories/user.repository.js (§6: "Reuse the repository's
- * existing user-resolution logic. Do not create a second users table."). The
- * resolved id then goes into the repository call, which filters on it in SQL. No
- * function in this file looks up a material by id alone.
- *
- * The asymmetry between upload and the read paths is deliberate and mirrors what
- * /api/ask already does: uploading CREATES the user on demand (a student who has
- * never logged in can still upload), while listing, reading and deleting do NOT —
- * reading a URL must not write a row. An unknown username therefore gets an empty
- * list, or a 404 for a specific material.
- *
- * THE LIMITATION, STATED PLAINLY
- * ------------------------------
- * A username is a claim, not a credential. Anyone who knows a student's username
- * can upload materials as them, list their documents and delete them. The
- * ownership checks below are real — they stop student A from reaching student B's
- * material by ID — but they cannot stop someone from simply asserting they ARE
- * student B. That is S1 in docs/security-baseline.md, it is unchanged by this
- * ticket (§21: "Do not attempt to solve authentication in this task"), and it is
- * the reason this API is not fit for real student data yet.
+// SP-V2-008: ownership is scoped by the authenticated immutable users.id.
+/** Material orchestration. Controllers supply req.user.id; repositories filter
+ * by that immutable ID. Users are created only by authentication registration.
+ * Storage validation, processing, indexing and response DTOs remain unchanged.
  */
 
 import { config } from "../config/env.js";
 import { logger } from "../utils/logger.js";
-import * as users from "../repositories/user.repository.js";
+import { assertUserId } from "../auth/identity.js";
 import * as storage from "../storage/local-storage.service.js";
 import { badRequest, notFound } from "../utils/app-error.js";
 import { validateUpload } from "./file-validation.js";
@@ -54,7 +26,7 @@ import { indexMaterial } from "./material-indexing.service.js";
  *   • any filesystem path — no path exists above local-storage.service.js at all;
  *     this module has never seen one.
  *   • `user_id` — an internal surrogate key. The client already knows which
- *     username it asked about, so returning the id only exposes an enumerable
+ *     userId it asked about, so returning the id only exposes an enumerable
  *     identifier.
  *
  * camelCase, following §18's example shape. That differs from the snake_case
@@ -164,11 +136,11 @@ function toApiShape(row, chunkCount) {
  * searchable" is that field.
  *
  * @param {object} input
- * @param {string} input.username
+ * @param {number} input.userId
  * @param {{originalname: string, mimetype: string, buffer: Buffer}} input.file
  * @returns {Promise<object>} the API view of the finished material
  */
-export async function uploadMaterial({ username, file }) {
+export async function uploadMaterial({ userId, file }) {
   if (!file) {
     throw badRequest("A file is required.");
   }
@@ -181,10 +153,8 @@ export async function uploadMaterial({ username, file }) {
     buffer: file.buffer,
   });
 
-  // Created on demand, exactly as /api/ask does — a student who has never called
-  // POST /api/session can still upload. Uses the existing repository; there is no
-  // second user table.
-  const user = await users.upsert(username);
+  // Authentication established this immutable owner before upload parsing.
+  assertUserId(userId);
 
   const { key: storageKey } = await storage.save({
     buffer: file.buffer,
@@ -194,7 +164,7 @@ export async function uploadMaterial({ username, file }) {
   let material;
   try {
     material = await materialRepository.insert({
-      userId: user.id,
+      userId,
       // Stored as the client sent it, for display only. It is never a path: the
       // storage key above was generated independently and the filename does not
       // contribute to it.
@@ -222,7 +192,7 @@ export async function uploadMaterial({ username, file }) {
   // saying that here — where the reader can see `status` — is clearer than two
   // queries that discover it.
   const indexed =
-    processed.status === "ready" ? await indexAfterUpload(processed, user.id) : processed;
+    processed.status === "ready" ? await indexAfterUpload(processed, userId) : processed;
 
   // Counted rather than assumed: the response's chunkCount comes from the
   // database, so it reports what was actually persisted. Zero for a failed
@@ -267,17 +237,16 @@ async function indexAfterUpload(processed, userId) {
  * A user's materials, newest first.
  *
  * No document content, no chunk text — the repository's single query selects
- * neither (§10: "must not return document contents"). An unknown username gives
+ * neither (§10: "must not return document contents"). An unknown userId gives
  * an empty array rather than a 404, matching GET /api/history: the frontend maps
  * over the result unguarded, and "this user has nothing" and "this user does not
  * exist" are the same answer to a client that cannot authenticate anyway.
  *
- * @param {string} username
+ * @param {number} userId
  * @returns {Promise<Array<object>>} always an array
  */
-export async function listMaterials(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) return [];
+export async function listMaterials(userId) {
+  assertUserId(userId);
 
   const rows = await materialRepository.findByUserId(
     userId,
@@ -292,12 +261,12 @@ export async function listMaterials(username) {
  *
  * @param {object} input
  * @param {number} input.id
- * @param {string} input.username
+ * @param {number} input.userId
  * @returns {Promise<object>}
  * @throws {AppError} 404 if it does not exist OR is not theirs
  */
-export async function getMaterial({ id, username }) {
-  const { material } = await requireOwnedMaterial({ id, username });
+export async function getMaterial({ id, userId }) {
+  const { material } = await requireOwnedMaterial({ id, userId });
   const chunkCount = await materialRepository.countChunks(material.id);
   return toApiShape(material, chunkCount);
 }
@@ -318,12 +287,12 @@ export async function getMaterial({ id, username }) {
  *
  * @param {object} input
  * @param {number} input.id
- * @param {string} input.username
+ * @param {number} input.userId
  * @returns {Promise<object>}
  * @throws {AppError} 404
  */
-export async function getMaterialStatus({ id, username }) {
-  const { material } = await requireOwnedMaterial({ id, username });
+export async function getMaterialStatus({ id, userId }) {
+  const { material } = await requireOwnedMaterial({ id, userId });
   const chunkCount = await materialRepository.countChunks(material.id);
 
   const status = {
@@ -350,12 +319,12 @@ export async function getMaterialStatus({ id, username }) {
  *
  * @param {object} input
  * @param {number} input.id
- * @param {string} input.username
+ * @param {number} input.userId
  * @returns {Promise<{id: number, deleted: true}>}
  * @throws {AppError} 404 if it does not exist OR is not theirs
  */
-export async function deleteMaterial({ id, username }) {
-  const userId = await requireUserId(username);
+export async function deleteMaterial({ id, userId }) {
+  assertUserId(userId);
 
   const storageKey = await materialRepository.deleteOwnedById(id, userId);
   if (storageKey === undefined) {
@@ -372,23 +341,19 @@ export async function deleteMaterial({ id, username }) {
 }
 
 /**
- * Resolve a username to a user id, or 404.
+ * Resolve a userId to a user id, or 404.
  *
- * Read paths do not create users, so an unknown username on a per-material
+ * Read paths do not create users, so an unknown userId on a per-material
  * endpoint is a 404 — the same answer as a material that does not exist, which is
- * what keeps the API from confirming whether a given id or username is real.
+ * what keeps the API from confirming whether a given id or userId is real.
  *
- * @param {string} username
+ * @param {number} userId
  * @returns {Promise<number>}
  */
-async function requireUserId(username) {
-  const userId = await users.findIdByUsername(username);
-  if (userId === undefined) throw notFoundMaterial();
-  return userId;
-}
+
 
 /**
- * Fetch a material, requiring that it belongs to this username.
+ * Fetch a material, requiring that it belongs to this userId.
  *
  * The single choke point for §6's "Never trust a material ID alone for
  * user-scoped operations": every read path goes through here, and the repository
@@ -396,11 +361,11 @@ async function requireUserId(username) {
  *
  * @param {object} input
  * @param {number} input.id
- * @param {string} input.username
+ * @param {number} input.userId
  * @returns {Promise<{material: object, userId: number}>}
  */
-async function requireOwnedMaterial({ id, username }) {
-  const userId = await requireUserId(username);
+async function requireOwnedMaterial({ id, userId }) {
+  assertUserId(userId);
   const material = await materialRepository.findOwnedById(id, userId);
   if (!material) throw notFoundMaterial();
   return { material, userId };
@@ -411,7 +376,7 @@ async function requireOwnedMaterial({ id, username }) {
  *
  * One message for four different situations — no such user, no such material,
  * someone else's material, already deleted — because distinguishing them would
- * tell an unauthenticated caller which material ids exist. 404 rather than 403
+ * tell a caller which material ids exist. 404 rather than 403
  * for the same reason: a 403 confirms the resource is real.
  *
  * @returns {import("../utils/app-error.js").AppError}
